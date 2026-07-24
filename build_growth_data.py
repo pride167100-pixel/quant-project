@@ -23,7 +23,8 @@ def to_number(val):
 
 
 def get_financials(corp_code, bsns_year="2025", reprt_code="11011"):
-    """연결재무제표(CFS) 우선 조회, 없으면 개별재무제표(OFS)로 재시도"""
+    """연결재무제표(CFS) 우선 조회, 없으면 개별재무제표(OFS)로 재시도.
+    손익계산서(IS)에서 매출액/영업이익, 재무상태표(BS)에서 부채/자본/유동자산/유동부채까지 함께 추출."""
     url = "https://opendart.fss.or.kr/api/fnlttSinglAcnt.json"
 
     for fs_div in ["CFS", "OFS"]:
@@ -39,30 +40,47 @@ def get_financials(corp_code, bsns_year="2025", reprt_code="11011"):
             data = response.json()
 
             if data.get("status") != "000":
-                continue  # 데이터 없음 -> 다음 fs_div 시도
+                continue
 
             items = data.get("list", [])
             revenue_this, revenue_prev = None, None
             profit_this, profit_prev = None, None
+            debt_total, equity_total = None, None
+            current_assets, current_liab = None, None
 
             for item in items:
-                if item.get("sj_div") != "IS":
-                    continue
+                sj = item.get("sj_div")
                 name = item.get("account_nm", "")
-                if name == "매출액":
-                    revenue_this = to_number(item.get("thstrm_amount"))
-                    revenue_prev = to_number(item.get("frmtrm_amount"))
-                elif name == "영업이익":
-                    profit_this = to_number(item.get("thstrm_amount"))
-                    profit_prev = to_number(item.get("frmtrm_amount"))
 
-            if revenue_this is not None or profit_this is not None:
+                if sj == "IS":
+                    if name == "매출액":
+                        revenue_this = to_number(item.get("thstrm_amount"))
+                        revenue_prev = to_number(item.get("frmtrm_amount"))
+                    elif name == "영업이익":
+                        profit_this = to_number(item.get("thstrm_amount"))
+                        profit_prev = to_number(item.get("frmtrm_amount"))
+
+                elif sj == "BS":
+                    if name == "부채총계":
+                        debt_total = to_number(item.get("thstrm_amount"))
+                    elif name == "자본총계":
+                        equity_total = to_number(item.get("thstrm_amount"))
+                    elif name == "유동자산":
+                        current_assets = to_number(item.get("thstrm_amount"))
+                    elif name == "유동부채":
+                        current_liab = to_number(item.get("thstrm_amount"))
+
+            if revenue_this is not None or profit_this is not None or debt_total is not None:
                 return {
                     "재무제표종류": fs_div,
                     "매출액_당기": revenue_this,
                     "매출액_전기": revenue_prev,
                     "영업이익_당기": profit_this,
                     "영업이익_전기": profit_prev,
+                    "부채총계": debt_total,
+                    "자본총계": equity_total,
+                    "유동자산": current_assets,
+                    "유동부채": current_liab,
                 }
         except Exception:
             continue
@@ -71,6 +89,8 @@ def get_financials(corp_code, bsns_year="2025", reprt_code="11011"):
         "재무제표종류": None,
         "매출액_당기": None, "매출액_전기": None,
         "영업이익_당기": None, "영업이익_전기": None,
+        "부채총계": None, "자본총계": None,
+        "유동자산": None, "유동부채": None,
     }
 
 
@@ -78,6 +98,12 @@ def calc_growth(this, prev):
     if this is None or prev is None or prev == 0:
         return None
     return round((this - prev) / abs(prev) * 100, 2)
+
+
+def calc_ratio(numerator, denominator):
+    if numerator is None or denominator is None or denominator == 0:
+        return None
+    return round(numerator / denominator * 100, 2)
 
 
 def main():
@@ -100,6 +126,8 @@ def main():
             results.append({
                 "재무제표종류": None, "매출액_당기": None, "매출액_전기": None,
                 "영업이익_당기": None, "영업이익_전기": None,
+                "부채총계": None, "자본총계": None,
+                "유동자산": None, "유동부채": None,
             })
         else:
             info = get_financials(corp_code)
@@ -119,14 +147,19 @@ def main():
 
     final["매출액성장률(%)"] = final.apply(lambda r: calc_growth(r["매출액_당기"], r["매출액_전기"]), axis=1)
     final["영업이익성장률(%)"] = final.apply(lambda r: calc_growth(r["영업이익_당기"], r["영업이익_전기"]), axis=1)
+    final["부채비율(%)"] = final.apply(lambda r: calc_ratio(r["부채총계"], r["자본총계"]), axis=1)
+    final["유동비율(%)"] = final.apply(lambda r: calc_ratio(r["유동자산"], r["유동부채"]), axis=1)
 
     final.to_csv("growth_data.csv", index=False, encoding="utf-8-sig")
 
     elapsed = (datetime.now() - start_time).total_seconds()
-    success = final["매출액_당기"].notna().sum() + final["영업이익_당기"].notna().sum()
     print(f"\n완료! 소요시간: {elapsed:.1f}초 ({elapsed/60:.1f}분)")
     print(f"growth_data.csv 저장됨, 총 {len(final)}개 종목")
-    print(final[["종목코드", "종목명", "매출액성장률(%)", "영업이익성장률(%)"]].head(10))
+    print(final[["종목코드", "종목명", "매출액성장률(%)", "영업이익성장률(%)",
+                 "부채비율(%)", "유동비율(%)"]].head(10))
+    print("\n[각 지표별 정상 데이터 개수]")
+    for col in ["매출액성장률(%)", "영업이익성장률(%)", "부채비율(%)", "유동비율(%)"]:
+        print(f"  {col}: {final[col].notna().sum()} / {len(final)}")
 
 
 if __name__ == "__main__":

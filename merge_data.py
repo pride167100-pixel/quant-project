@@ -5,18 +5,21 @@ def main():
     growth = pd.read_csv("growth_data.csv", dtype={"종목코드": str})
     company = pd.read_csv("company_info.csv", dtype={"종목코드": str})
     sector = pd.read_csv("sector_info.csv", dtype={"종목코드": str})
+    momentum = pd.read_csv("momentum_data.csv", dtype={"종목코드": str})
 
-    growth_slim = growth[["종목코드", "매출액성장률(%)", "영업이익성장률(%)"]]
+    growth_slim = growth[["종목코드", "매출액성장률(%)", "영업이익성장률(%)", "부채비율(%)", "유동비율(%)"]]
 
     final = universe.merge(growth_slim, on="종목코드", how="left")
     final = final.merge(company, on="종목코드", how="left")
     final = final.merge(sector, on="종목코드", how="left")
+    final = final.merge(momentum, on="종목코드", how="left")
 
     preferred_order = [
         "종목코드", "종목명", "업종명", "시장구분", "대표자",
         "현재가", "등락률",
         "PBR", "PER", "ROE",
-        "매출액성장률(%)", "영업이익성장률(%)",
+        "매출액성장률(%)", "영업이익성장률(%)", "부채비율(%)", "유동비율(%)",
+        "3개월수익률(%)", "6개월수익률(%)", "12개월수익률(%)", "평균거래대금(억원)",
         "시가총액", "매출액", "영업이익",
         "EPS", "BPS", "상장주수", "결산월", "설립일", "주소"
     ]
