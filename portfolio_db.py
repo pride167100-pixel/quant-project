@@ -4,6 +4,11 @@ from datetime import datetime
 
 DB_PATH = "portfolio.db"
 
+# 거래비용 (참고용 근사치 - 실제 증권사/시기별로 다를 수 있으니 필요시 조정하세요)
+BUY_FEE_RATE = 0.00015   # 매수 수수료 약 0.015%
+SELL_FEE_RATE = 0.00015  # 매도 수수료 약 0.015%
+SELL_TAX_RATE = 0.0015   # 매도 시 증권거래세 약 0.15% (코스피/코스닥 근사치, 최신 세율은 별도 확인 권장)
+
 
 def get_connection():
     conn = sqlite3.connect(DB_PATH)
@@ -57,8 +62,138 @@ def init_db():
         )
     """)
 
+    # 기존에 만들어진 DB에도 fee/tax 컬럼을 안전하게 추가 (이미 있으면 에러 무시)
+    for column_def in ["fee REAL DEFAULT 0", "tax REAL DEFAULT 0"]:
+        try:
+            cur.execute(f"ALTER TABLE transactions ADD COLUMN {column_def}")
+        except sqlite3.OperationalError:
+            pass  # 이미 컬럼이 존재하는 경우
+
+    cur.execute("""
+        CREATE TABLE IF NOT EXISTS funding_events (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            preset_name TEXT NOT NULL,
+            event_date TEXT NOT NULL,
+            amount REAL NOT NULL,
+            event_type TEXT NOT NULL
+        )
+    """)
+
+    cur.execute("""
+        CREATE TABLE IF NOT EXISTS benchmark_events (
+            preset_name TEXT NOT NULL,
+            event_date TEXT NOT NULL,
+            benchmark_name TEXT NOT NULL,
+            price REAL,
+            PRIMARY KEY (preset_name, event_date, benchmark_name)
+        )
+    """)
+
     conn.commit()
     conn.close()
+
+
+def add_funding_event(preset_name, event_date, amount, event_type):
+    """자금 투입 이벤트(최초매수 또는 추가입금) 기록"""
+    conn = get_connection()
+    cur = conn.cursor()
+    cur.execute(
+        "INSERT INTO funding_events (preset_name, event_date, amount, event_type) VALUES (?, ?, ?, ?)",
+        (preset_name, event_date, amount, event_type)
+    )
+    conn.commit()
+    conn.close()
+
+
+def get_funding_events(preset_name):
+    """이 프리셋의 모든 자금 투입 이벤트를 [{event_date, amount, event_type}] 형태로 반환"""
+    conn = get_connection()
+    cur = conn.cursor()
+    cur.execute(
+        "SELECT event_date, amount, event_type FROM funding_events WHERE preset_name = ? ORDER BY event_date ASC",
+        (preset_name,)
+    )
+    result = [dict(row) for row in cur.fetchall()]
+    conn.close()
+    return result
+
+
+def save_benchmark_event_prices(preset_name, event_date, benchmark_prices):
+    """특정 투입 시점의 벤치마크 가격 저장 (이미 있으면 건드리지 않음)"""
+    conn = get_connection()
+    cur = conn.cursor()
+    for name, price in benchmark_prices.items():
+        if price is None:
+            continue
+        cur.execute(
+            "INSERT OR IGNORE INTO benchmark_events (preset_name, event_date, benchmark_name, price) "
+            "VALUES (?, ?, ?, ?)",
+            (preset_name, event_date, name, price)
+        )
+    conn.commit()
+    conn.close()
+
+
+def get_benchmark_event_prices(preset_name, event_date):
+    """특정 투입 시점의 벤치마크 가격을 {이름: 가격}으로 반환"""
+    conn = get_connection()
+    cur = conn.cursor()
+    cur.execute(
+        "SELECT benchmark_name, price FROM benchmark_events WHERE preset_name = ? AND event_date = ?",
+        (preset_name, event_date)
+    )
+    result = {row["benchmark_name"]: row["price"] for row in cur.fetchall()}
+    conn.close()
+    return result
+
+
+def add_deposit(preset_name, amount):
+    """프리셋에 추가 자금을 입금 (초기자본/현금잔고 모두 증가, 이벤트 기록)"""
+    from datetime import date
+    conn = get_connection()
+    cur = conn.cursor()
+    cur.execute(
+        "UPDATE portfolios SET initial_cash = initial_cash + ?, cash_balance = cash_balance + ? WHERE preset_name = ?",
+        (amount, amount, preset_name)
+    )
+    conn.commit()
+    conn.close()
+    add_funding_event(preset_name, date.today().isoformat(), amount, "DEPOSIT")
+    return True, f"{amount:,.0f}원 입금 완료"
+
+
+def delete_preset(preset_name):
+    """프리셋과 관련된 모든 데이터(조건, 포트폴리오, 보유종목, 거래내역, 벤치마크)를 삭제"""
+    conn = get_connection()
+    cur = conn.cursor()
+    for table in ["preset_criteria", "portfolios", "holdings", "transactions",
+                  "funding_events", "benchmark_events"]:
+        cur.execute(f"DELETE FROM {table} WHERE preset_name = ?", (preset_name,))
+    conn.commit()
+    conn.close()
+
+
+def duplicate_preset_criteria(source_name, new_name, initial_cash=10_000_000):
+    """조건만 복사해서 새 프리셋 생성 (보유종목/거래내역/벤치마크는 복사하지 않음, 시드머니는 초기화)"""
+    import json
+    criteria = load_preset_criteria(source_name)
+    if criteria is None:
+        return False, "원본 프리셋의 조건을 찾을 수 없습니다."
+
+    save_preset_criteria(new_name, criteria)
+    get_or_create_portfolio(new_name, initial_cash=initial_cash)
+    return True, f"'{new_name}' 생성 완료 (조건만 복사, 시드머니 {initial_cash:,.0f}원으로 새로 시작)"
+
+
+def generate_copy_name(source_name):
+    """기존 프리셋 이름 목록과 겹치지 않는 '(1)', '(2)'... 형태의 이름을 생성"""
+    existing = set(list_presets())
+    n = 1
+    while True:
+        candidate = f"{source_name} ({n})"
+        if candidate not in existing:
+            return candidate
+        n += 1
 
 
 def list_presets():
@@ -136,7 +271,9 @@ def buy_stocks(preset_name, orders):
     conn = get_connection()
     cur = conn.cursor()
 
-    total_cost = sum(o["quantity"] * o["price"] for o in orders)
+    gross_cost = sum(o["quantity"] * o["price"] for o in orders)
+    buy_fee = gross_cost * BUY_FEE_RATE
+    total_cost = gross_cost + buy_fee
 
     cur.execute("SELECT cash_balance FROM portfolios WHERE preset_name = ?", (preset_name,))
     row = cur.fetchone()
@@ -144,7 +281,7 @@ def buy_stocks(preset_name, orders):
 
     if total_cost > cash_balance:
         conn.close()
-        return False, f"현금 부족: 필요 {total_cost:,.0f}원, 보유 현금 {cash_balance:,.0f}원"
+        return False, f"현금 부족: 필요 {total_cost:,.0f}원(수수료 포함), 보유 현금 {cash_balance:,.0f}원"
 
     for o in orders:
         cur.execute(
@@ -153,9 +290,15 @@ def buy_stocks(preset_name, orders):
         )
         existing = cur.fetchone()
 
+        # 종목별 수수료 배분 (매입금액 비중대로)
+        order_amount = o["quantity"] * o["price"]
+        order_fee = order_amount * BUY_FEE_RATE
+        # 평균매입가에는 수수료까지 포함해 반영 (실제 원가 기준)
+        effective_price = o["price"] + (order_fee / o["quantity"] if o["quantity"] else 0)
+
         if existing:
             new_qty = existing["quantity"] + o["quantity"]
-            new_avg = (existing["quantity"] * existing["avg_buy_price"] + o["quantity"] * o["price"]) / new_qty
+            new_avg = (existing["quantity"] * existing["avg_buy_price"] + o["quantity"] * effective_price) / new_qty
             cur.execute(
                 "UPDATE holdings SET quantity = ?, avg_buy_price = ? WHERE preset_name = ? AND stock_code = ?",
                 (new_qty, new_avg, preset_name, o["stock_code"])
@@ -163,13 +306,14 @@ def buy_stocks(preset_name, orders):
         else:
             cur.execute(
                 "INSERT INTO holdings (preset_name, stock_code, stock_name, quantity, avg_buy_price) VALUES (?, ?, ?, ?, ?)",
-                (preset_name, o["stock_code"], o["stock_name"], o["quantity"], o["price"])
+                (preset_name, o["stock_code"], o["stock_name"], o["quantity"], effective_price)
             )
 
         cur.execute(
-            "INSERT INTO transactions (preset_name, stock_code, stock_name, action, quantity, price, amount, timestamp) VALUES (?, ?, ?, 'BUY', ?, ?, ?, ?)",
+            "INSERT INTO transactions (preset_name, stock_code, stock_name, action, quantity, price, amount, fee, tax, timestamp) "
+            "VALUES (?, ?, ?, 'BUY', ?, ?, ?, ?, 0, ?)",
             (preset_name, o["stock_code"], o["stock_name"], o["quantity"], o["price"],
-             o["quantity"] * o["price"], datetime.now().isoformat())
+             order_amount, order_fee, datetime.now().isoformat())
         )
 
     cur.execute(
@@ -179,7 +323,15 @@ def buy_stocks(preset_name, orders):
 
     conn.commit()
     conn.close()
-    return True, f"매수 완료: 총 {total_cost:,.0f}원"
+
+    # 이 프리셋의 최초 매수라면, 초기자본 전체를 하나의 자금투입 이벤트로 기록 (벤치마크 비교용)
+    from datetime import date
+    existing_events = get_funding_events(preset_name)
+    if not any(e["event_type"] == "INITIAL" for e in existing_events):
+        portfolio = get_or_create_portfolio(preset_name)
+        add_funding_event(preset_name, date.today().isoformat(), portfolio["initial_cash"], "INITIAL")
+
+    return True, f"매수 완료: 총 {total_cost:,.0f}원 (수수료 {buy_fee:,.0f}원 포함)"
 
 
 def sell_stocks(preset_name, sell_orders):
@@ -187,7 +339,9 @@ def sell_stocks(preset_name, sell_orders):
     conn = get_connection()
     cur = conn.cursor()
 
-    total_proceeds = 0
+    total_net_proceeds = 0
+    total_fee = 0
+    total_tax = 0
 
     for o in sell_orders:
         cur.execute(
@@ -199,8 +353,14 @@ def sell_stocks(preset_name, sell_orders):
             continue
 
         qty = existing["quantity"]
-        proceeds = qty * o["price"]
-        total_proceeds += proceeds
+        gross_proceeds = qty * o["price"]
+        fee = gross_proceeds * SELL_FEE_RATE
+        tax = gross_proceeds * SELL_TAX_RATE
+        net_proceeds = gross_proceeds - fee - tax
+
+        total_net_proceeds += net_proceeds
+        total_fee += fee
+        total_tax += tax
 
         cur.execute(
             "DELETE FROM holdings WHERE preset_name = ? AND stock_code = ?",
@@ -208,18 +368,52 @@ def sell_stocks(preset_name, sell_orders):
         )
 
         cur.execute(
-            "INSERT INTO transactions (preset_name, stock_code, stock_name, action, quantity, price, amount, timestamp) VALUES (?, ?, ?, 'SELL', ?, ?, ?, ?)",
-            (preset_name, o["stock_code"], o["stock_name"], qty, o["price"], proceeds, datetime.now().isoformat())
+            "INSERT INTO transactions (preset_name, stock_code, stock_name, action, quantity, price, amount, fee, tax, timestamp) "
+            "VALUES (?, ?, ?, 'SELL', ?, ?, ?, ?, ?, ?)",
+            (preset_name, o["stock_code"], o["stock_name"], qty, o["price"], gross_proceeds, fee, tax,
+             datetime.now().isoformat())
         )
 
     cur.execute(
         "UPDATE portfolios SET cash_balance = cash_balance + ? WHERE preset_name = ?",
-        (total_proceeds, preset_name)
+        (total_net_proceeds, preset_name)
     )
 
     conn.commit()
     conn.close()
-    return True, f"매도 완료: 총 {total_proceeds:,.0f}원"
+    return True, (f"매도 완료: 실수령액 {total_net_proceeds:,.0f}원 "
+                  f"(수수료 {total_fee:,.0f}원 + 거래세 {total_tax:,.0f}원 차감)")
+
+
+def backfill_initial_funding_event(preset_name):
+    """funding_events가 비어있는데 과거 거래내역(transactions)이 있으면, 그 최초 매수일로 INITIAL 이벤트를 소급 생성"""
+    existing = get_funding_events(preset_name)
+    if existing:
+        return existing  # 이미 있으면 그대로 반환
+
+    earliest_date = get_earliest_buy_date(preset_name)
+    if earliest_date is None:
+        return []  # 매수 이력 자체가 없음
+
+    portfolio = get_or_create_portfolio(preset_name)
+    add_funding_event(preset_name, earliest_date, portfolio["initial_cash"], "INITIAL")
+    return get_funding_events(preset_name)
+
+
+def get_earliest_buy_date(preset_name):
+    """이 프리셋의 첫 매수 거래 날짜(YYYY-MM-DD)를 반환. 매수 이력이 없으면 None"""
+    conn = get_connection()
+    cur = conn.cursor()
+    cur.execute(
+        "SELECT timestamp FROM transactions WHERE preset_name = ? AND action = 'BUY' "
+        "ORDER BY timestamp ASC LIMIT 1",
+        (preset_name,)
+    )
+    row = cur.fetchone()
+    conn.close()
+    if row is None:
+        return None
+    return row["timestamp"][:10]  # YYYY-MM-DD 부분만
 
 
 def get_transactions(preset_name):

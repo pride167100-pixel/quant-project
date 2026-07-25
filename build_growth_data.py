@@ -44,7 +44,7 @@ def get_financials(corp_code, bsns_year="2025", reprt_code="11011"):
 
             items = data.get("list", [])
             revenue_this, revenue_prev = None, None
-            profit_this, profit_prev = None, None
+            profit_this, profit_prev, profit_before_prev = None, None, None
             debt_total, equity_total = None, None
             current_assets, current_liab = None, None
 
@@ -59,6 +59,7 @@ def get_financials(corp_code, bsns_year="2025", reprt_code="11011"):
                     elif name == "영업이익":
                         profit_this = to_number(item.get("thstrm_amount"))
                         profit_prev = to_number(item.get("frmtrm_amount"))
+                        profit_before_prev = to_number(item.get("bfefrmtrm_amount"))
 
                 elif sj == "BS":
                     if name == "부채총계":
@@ -77,6 +78,7 @@ def get_financials(corp_code, bsns_year="2025", reprt_code="11011"):
                     "매출액_전기": revenue_prev,
                     "영업이익_당기": profit_this,
                     "영업이익_전기": profit_prev,
+                    "영업이익_전전기": profit_before_prev,
                     "부채총계": debt_total,
                     "자본총계": equity_total,
                     "유동자산": current_assets,
@@ -88,7 +90,7 @@ def get_financials(corp_code, bsns_year="2025", reprt_code="11011"):
     return {
         "재무제표종류": None,
         "매출액_당기": None, "매출액_전기": None,
-        "영업이익_당기": None, "영업이익_전기": None,
+        "영업이익_당기": None, "영업이익_전기": None, "영업이익_전전기": None,
         "부채총계": None, "자본총계": None,
         "유동자산": None, "유동부채": None,
     }
@@ -125,7 +127,7 @@ def main():
         if pd.isna(corp_code):
             results.append({
                 "재무제표종류": None, "매출액_당기": None, "매출액_전기": None,
-                "영업이익_당기": None, "영업이익_전기": None,
+                "영업이익_당기": None, "영업이익_전기": None, "영업이익_전전기": None,
                 "부채총계": None, "자본총계": None,
                 "유동자산": None, "유동부채": None,
             })
@@ -150,15 +152,23 @@ def main():
     final["부채비율(%)"] = final.apply(lambda r: calc_ratio(r["부채총계"], r["자본총계"]), axis=1)
     final["유동비율(%)"] = final.apply(lambda r: calc_ratio(r["유동자산"], r["유동부채"]), axis=1)
 
+    def check_3year_profit(row):
+        vals = [row["영업이익_당기"], row["영업이익_전기"], row["영업이익_전전기"]]
+        if any(v is None or pd.isna(v) for v in vals):
+            return None
+        return bool(all(v > 0 for v in vals))
+
+    final["3년연속흑자"] = final.apply(check_3year_profit, axis=1).astype("object")
+
     final.to_csv("growth_data.csv", index=False, encoding="utf-8-sig")
 
     elapsed = (datetime.now() - start_time).total_seconds()
     print(f"\n완료! 소요시간: {elapsed:.1f}초 ({elapsed/60:.1f}분)")
     print(f"growth_data.csv 저장됨, 총 {len(final)}개 종목")
     print(final[["종목코드", "종목명", "매출액성장률(%)", "영업이익성장률(%)",
-                 "부채비율(%)", "유동비율(%)"]].head(10))
+                 "부채비율(%)", "유동비율(%)", "3년연속흑자"]].head(10))
     print("\n[각 지표별 정상 데이터 개수]")
-    for col in ["매출액성장률(%)", "영업이익성장률(%)", "부채비율(%)", "유동비율(%)"]:
+    for col in ["매출액성장률(%)", "영업이익성장률(%)", "부채비율(%)", "유동비율(%)", "3년연속흑자"]:
         print(f"  {col}: {final[col].notna().sum()} / {len(final)}")
 
 

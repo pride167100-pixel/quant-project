@@ -7,7 +7,7 @@ def main():
     sector = pd.read_csv("sector_info.csv", dtype={"종목코드": str})
     momentum = pd.read_csv("momentum_data.csv", dtype={"종목코드": str})
 
-    growth_slim = growth[["종목코드", "매출액성장률(%)", "영업이익성장률(%)", "부채비율(%)", "유동비율(%)"]]
+    growth_slim = growth[["종목코드", "매출액성장률(%)", "영업이익성장률(%)", "부채비율(%)", "유동비율(%)", "3년연속흑자"]]
 
     final = universe.merge(growth_slim, on="종목코드", how="left")
     final = final.merge(company, on="종목코드", how="left")
