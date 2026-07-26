@@ -5,6 +5,11 @@ import portfolio_db as db
 import kis_realtime as kis
 import benchmark_prices as bp
 from benchmark_config import BENCHMARK_ETFS
+import backtest_engine as bt
+from screener_logic import (
+    CRITERIA_DEFS, FILTER_COLUMN_MAP, RANKING_INDICATORS,
+    filter_stocks, summarize_criteria, summarize_criteria_lines, rank_stocks
+)
 
 db.init_db()
 
@@ -36,45 +41,6 @@ HELP_TEXT = {
     "liquidity": "최근 12주 평균 일별 거래대금(억원)입니다.\n\n"
                  "**너무 작으면** 원하는 가격에 매수/매도가 어려울 수 있습니다 (유동성 위험).",
 }
-
-# 저장/불러오기 대상이 되는 모든 조건 위젯 키 목록
-CRITERIA_DEFS = [
-    ("use_pbr", "pbr", "PBR 이하", True, 0.0, 5.0, 1.0, 0.1, "≤"),
-    ("use_per", "per", "PER 이하", True, 0.0, 50.0, 15.0, 1.0, "≤"),
-    ("use_roe", "roe", "ROE 이상", True, -20.0, 50.0, 5.0, 1.0, "≥"),
-    ("use_debt", "debt", "부채비율 이하", False, 0.0, 500.0, 100.0, 10.0, "≤"),
-    ("use_current", "current", "유동비율 이상", False, 0.0, 500.0, 100.0, 10.0, "≥"),
-    ("use_rev", "rev", "매출액성장률 이상", False, -50.0, 100.0, 0.0, 5.0, "≥"),
-    ("use_op", "op", "영업이익성장률 이상", False, -50.0, 100.0, 10.0, 5.0, "≥"),
-    ("use_cap", "cap", "시가총액 이상", True, 0.0, 50000.0, 1000.0, 100.0, "≥"),
-    ("use_liquidity", "liquidity", "거래대금 이상", False, 0.0, 1000.0, 5.0, 1.0, "≥"),
-    ("use_mom3", "mom3", "3개월수익률 이상", False, -80.0, 300.0, -20.0, 5.0, "≥"),
-    ("use_mom6", "mom6", "6개월수익률 이상", False, -80.0, 300.0, -20.0, 5.0, "≥"),
-    ("use_mom12", "mom12", "12개월수익률 이상", False, -80.0, 500.0, -20.0, 5.0, "≥"),
-]
-
-FILTER_COLUMN_MAP = {
-    "pbr": ("PBR", "le"), "per": ("PER", "le"), "roe": ("ROE", "ge"),
-    "debt": ("부채비율(%)", "le"), "current": ("유동비율(%)", "ge"),
-    "rev": ("매출액성장률(%)", "ge"), "op": ("영업이익성장률(%)", "ge"),
-    "cap": ("시가총액", "ge"), "liquidity": ("평균거래대금(억원)", "ge"),
-    "mom3": ("3개월수익률(%)", "ge"), "mom6": ("6개월수익률(%)", "ge"), "mom12": ("12개월수익률(%)", "ge"),
-}
-
-# 랭킹 모드에서 사용할 지표 목록: (표시라벨, 실제컬럼명, "low"=낮을수록좋음/"high"=높을수록좋음)
-RANKING_INDICATORS = [
-    ("PER (낮을수록 좋음)", "PER", "low"),
-    ("PBR (낮을수록 좋음)", "PBR", "low"),
-    ("ROE (높을수록 좋음)", "ROE", "high"),
-    ("부채비율 (낮을수록 좋음)", "부채비율(%)", "low"),
-    ("유동비율 (높을수록 좋음)", "유동비율(%)", "high"),
-    ("매출액성장률 (높을수록 좋음)", "매출액성장률(%)", "high"),
-    ("영업이익성장률 (높을수록 좋음)", "영업이익성장률(%)", "high"),
-    ("3개월수익률 (높을수록 좋음)", "3개월수익률(%)", "high"),
-    ("6개월수익률 (높을수록 좋음)", "6개월수익률(%)", "high"),
-    ("12개월수익률 (높을수록 좋음)", "12개월수익률(%)", "high"),
-]
-
 
 def sync_from_slider(key):
     st.session_state[f"{key}_num"] = st.session_state[f"{key}_slider"]
@@ -121,90 +87,13 @@ def apply_criteria_to_state(criteria):
         st.session_state["use_3year_profit"] = criteria["use_3year_profit"]
 
 
-def filter_stocks(df, criteria):
-    """조건 딕셔너리를 데이터프레임에 적용해서 필터링 결과 반환"""
-    filtered = df.copy()
-    for use_key, key, *_ in CRITERIA_DEFS:
-        if criteria.get(use_key):
-            col, op = FILTER_COLUMN_MAP[key]
-            threshold = criteria.get(f"{key}_slider")
-            if threshold is None or col not in filtered.columns:
-                continue
-            if key == "per":
-                filtered = filtered[(filtered[col] <= threshold) & (filtered[col] > 0)]
-            elif op == "le":
-                filtered = filtered[filtered[col] <= threshold]
-            else:
-                filtered = filtered[filtered[col] >= threshold]
-    if criteria.get("use_3year_profit") and "3년연속흑자" in filtered.columns:
-        filtered = filtered[filtered["3년연속흑자"] == True]
-    return filtered
-
-
-def summarize_criteria(criteria):
-    """조건을 사람이 읽기 좋은 한 줄로 요약 (비교표 등 간단 표시용)"""
-    parts = []
-    for use_key, key, label, *_rest in CRITERIA_DEFS:
-        sign = _rest[-1]
-        if criteria.get(use_key):
-            val = criteria.get(f"{key}_slider")
-            short_label = label.replace(" 이하", "").replace(" 이상", "")
-            parts.append(f"{short_label}{sign}{val}")
-    if criteria.get("use_3year_profit"):
-        parts.append("3년연속흑자")
-    return ", ".join(parts) if parts else "(설정된 조건 없음)"
-
-
-def summarize_criteria_lines(criteria):
-    """조건을 카테고리별로 묶어 여러 줄로 반환 (카드 형태 표시용)"""
-    category_map = {
-        "가치": ["pbr", "per"],
-        "퀄리티": ["roe", "debt", "current"],
-        "성장": ["rev", "op"],
-        "규모": ["cap", "liquidity"],
-        "모멘텀": ["mom3", "mom6", "mom12"],
-    }
-    lookup = {key: (label, _rest[-1]) for use_key, key, label, *_rest in CRITERIA_DEFS}
-    use_lookup = {key: use_key for use_key, key, *_ in CRITERIA_DEFS}
-
-    lines = []
-    for category, keys in category_map.items():
-        active = []
-        for key in keys:
-            use_key = use_lookup[key]
-            if criteria.get(use_key):
-                label, sign = lookup[key]
-                val = criteria.get(f"{key}_slider")
-                short_label = label.replace(" 이하", "").replace(" 이상", "")
-                active.append(f"{short_label} {sign} {val}")
-        if category == "성장" and criteria.get("use_3year_profit"):
-            active.append("3년연속흑자")
-        if active:
-            lines.append(f"**{category}**: {' · '.join(active)}")
-    return lines if lines else ["(설정된 조건 없음)"]
-
-
-def rank_stocks(df, selected_labels, top_n):
-    """선택된 지표들로 순위를 매겨 합산순위 기준 상위 N개 반환"""
-    label_map = {label: (col, better) for label, col, better in RANKING_INDICATORS}
-    selected = [label_map[label] for label in selected_labels]
-
-    if not selected:
-        return df.head(0), []
-
-    cols_needed = [col for col, _ in selected]
-    ranked = df.dropna(subset=cols_needed).copy()
-
-    rank_cols = []
-    for col, better in selected:
-        rank_col = f"순위_{col}"
-        ranked[rank_col] = ranked[col].rank(method="min", ascending=(better == "low"))
-        rank_cols.append(rank_col)
-
-    ranked["합산순위"] = ranked[rank_cols].sum(axis=1)
-    ranked = ranked.sort_values("합산순위").head(top_n).reset_index(drop=True)
-    ranked.insert(0, "최종순위", range(1, len(ranked) + 1))
-    return ranked, rank_cols
+def normalize_date_index(df, date_col="날짜", value_col="총자산", new_name=None):
+    """서로 다른 백테스트 실행 간 미세한 시각 차이를 없애기 위해 날짜만 남기고 인덱스로 설정"""
+    out = df[[date_col, value_col]].copy()
+    out[date_col] = pd.to_datetime(out[date_col]).dt.normalize()
+    if new_name:
+        out = out.rename(columns={value_col: new_name})
+    return out.set_index(date_col)
 
 
 def format_currency_cols(view_df, cols):
@@ -287,7 +176,7 @@ df = load_data()
 st.sidebar.title("메뉴")
 st.sidebar.caption(f"📅 데이터 기준: {get_data_timestamp()}")
 
-page = st.sidebar.radio("화면 선택", ["스크리너 & 모의매매", "프리셋 비교"])
+page = st.sidebar.radio("화면 선택", ["스크리너 & 모의매매", "프리셋 비교", "백테스터"])
 
 saved_presets = db.list_presets()
 
@@ -671,7 +560,7 @@ if page == "스크리너 & 모의매매":
 # ══════════════════════════════════════════════════════════
 # 프리셋 비교 화면
 # ══════════════════════════════════════════════════════════
-else:
+elif page == "프리셋 비교":
     st.title("📊 프리셋 비교")
 
     if not saved_presets:
@@ -786,3 +675,223 @@ else:
                                     )
 
         st.caption("💡 '조건 통과 종목 수'는 현재 데이터 기준 실시간 계산, '총 수익률'은 각 프리셋의 모의매매 실적입니다.")
+
+
+# ══════════════════════════════════════════════════════════
+# 백테스터 화면
+# ══════════════════════════════════════════════════════════
+else:
+    st.title("⏱️ 백테스터")
+    st.caption("과거 특정 시점부터 이 프리셋 조건으로 매달 리밸런싱했다면 어땠을지 계산합니다. "
+               "API 호출 없이 미리 받아둔 데이터로만 계산해서 몇 초~몇 분이면 끝납니다.")
+
+    st.warning(
+        "⚠️ 이 백테스트는 다음과 같은 한계가 있습니다:\n"
+        "- **생존편향**: 현재 상장된 종목만 대상이라, 그 사이 상장폐지된 종목은 반영되지 않아 실제보다 유리하게 나올 수 있습니다.\n"
+        "- **발행주식수**: 과거 시점이 아닌 현재 발행주식수를 사용해 시가총액/PBR/PER을 근사 계산합니다.\n"
+        "- **재무데이터 공시시차**: 4월 1일을 기준으로 전년도/재작년도 실적 중 '그 시점에 이미 공시됐을' 데이터를 근사적으로 사용합니다.\n"
+        "- **필터 모드 조건만 지원**: 랭킹 모드로 저장된 조건은 아직 지원하지 않습니다."
+    )
+
+    if not saved_presets:
+        st.info("저장된 프리셋이 없습니다. 먼저 '스크리너 & 모의매매' 화면에서 조건을 저장해주세요.")
+    else:
+        col1, col2, col3 = st.columns(3)
+        with col1:
+            bt_preset = st.selectbox("백테스트할 프리셋", saved_presets, key="bt_preset_select")
+        with col2:
+            months_option = st.selectbox(
+                "시작 시점", [3, 6, 12, 24, 36],
+                index=2, format_func=lambda m: f"{m}개월 전부터", key="bt_months_back"
+            )
+        with col3:
+            bt_initial_amount = st.number_input(
+                "시작 자금 (원)", min_value=100_000, value=10_000_000, step=1_000_000, key="bt_initial_amount"
+            )
+
+        bt_use_ranking = st.checkbox(
+            "상위 N개만 골라 매달 리밸런싱 (랭킹 모드)", key="bt_use_ranking",
+            help="1차 필터를 통과한 종목 중, 선택한 지표들의 순위를 합산해 상위 N개만 매달 다시 선정합니다."
+        )
+        bt_ranking_indicators = None
+        bt_top_n = 20
+        compare_n_values = []
+        if bt_use_ranking:
+            bt_ranking_indicators = st.multiselect(
+                "랭킹에 사용할 지표", [label for label, _, _ in RANKING_INDICATORS],
+                default=[l for l in [label for label, _, _ in RANKING_INDICATORS] if l.startswith(("PER", "PBR", "ROE"))],
+                key="bt_ranking_indicators"
+            )
+
+            compare_n_values = st.multiselect(
+                "종목 수를 바꿔가며 비교해보기 (선택하면 아래 '상위 몇 개'는 무시됩니다)",
+                [3, 5, 10, 15, 20, 30, 50],
+                default=[], key="bt_compare_n_values"
+            )
+
+            if not compare_n_values:
+                bt_top_n = st.number_input("상위 몇 개", min_value=1, max_value=100, value=20, step=1, key="bt_top_n")
+
+        if st.button("▶️ 백테스트 실행", type="primary"):
+            criteria = db.load_preset_criteria(bt_preset)
+            if criteria is None:
+                st.error("이 프리셋의 조건을 불러올 수 없습니다.")
+            elif bt_use_ranking and compare_n_values:
+                # 종목 수 비교 모드: 여러 top_n으로 반복 실행
+                progress_bar = st.progress(0.0, text="종목 수별 비교 계산 중...")
+                n_list = sorted(compare_n_values)
+                comparison_results = {}
+
+                for i, n in enumerate(n_list):
+                    def _update_progress(step, total, n=n, i=i):
+                        overall = (i + step / total) / len(n_list)
+                        progress_bar.progress(overall, text=f"{n}개 종목 기준 계산 중... ({i+1}/{len(n_list)})")
+
+                    try:
+                        comparison_results[n] = bt.run_backtest(
+                            criteria, months_back=months_option,
+                            initial_amount=bt_initial_amount, progress_callback=_update_progress,
+                            use_ranking=True, ranking_indicators=bt_ranking_indicators, top_n=n
+                        )
+                    except FileNotFoundError as e:
+                        st.error(f"필요한 데이터 파일을 찾을 수 없습니다: {e}")
+                        comparison_results = None
+                        break
+
+                progress_bar.empty()
+                st.session_state["_backtest_n_comparison"] = comparison_results
+                st.session_state["_backtest_result"] = None  # 단일결과는 비교모드에서 숨김
+                st.session_state["_backtest_preset_name"] = bt_preset
+            else:
+                progress_bar = st.progress(0.0, text="백테스트 계산 중...")
+
+                def _update_progress(step, total):
+                    progress_bar.progress(step / total, text=f"백테스트 계산 중... ({step}/{total}개월)")
+
+                try:
+                    result = bt.run_backtest(
+                        criteria, months_back=months_option,
+                        initial_amount=bt_initial_amount, progress_callback=_update_progress,
+                        use_ranking=bt_use_ranking, ranking_indicators=bt_ranking_indicators, top_n=bt_top_n
+                    )
+                    progress_bar.empty()
+                    st.session_state["_backtest_result"] = result
+                    st.session_state["_backtest_n_comparison"] = None  # 비교모드 결과는 단일실행에서 숨김
+                    st.session_state["_backtest_preset_name"] = bt_preset
+                except FileNotFoundError as e:
+                    progress_bar.empty()
+                    st.error(f"필요한 데이터 파일을 찾을 수 없습니다: {e}\n"
+                             "historical_financials.csv, historical_prices.csv가 있는지 확인해주세요.")
+
+        result = st.session_state.get("_backtest_result")
+        if result:
+            st.divider()
+            st.subheader(f"📊 결과: {st.session_state.get('_backtest_preset_name')}")
+
+            col1, col2, col3 = st.columns(3)
+            col1.metric("시작 자금", f"{result['initial_amount']:,.0f}원")
+            col2.metric("최종 자산", f"{result['final_value']:,.0f}원")
+            col3.metric("총 수익률", f"{result['final_return']:+.2f}%")
+
+            st.caption("그래프에 표시할 벤치마크 선택")
+            bench_toggle_cols = st.columns(len(result["benchmarks"]))
+            selected_benches_single = {}
+            for i, name in enumerate(result["benchmarks"].keys()):
+                selected_benches_single[name] = bench_toggle_cols[i].checkbox(
+                    name, value=True, key=f"bt_single_bench_{name}"
+                )
+
+            # 차트용 데이터프레임 구성 (날짜 정규화로 시각 오차 제거)
+            chart_df = normalize_date_index(pd.DataFrame(result["portfolio"]), value_col="총자산", new_name="내 프리셋")
+
+            for name, series in result["benchmarks"].items():
+                if not selected_benches_single.get(name):
+                    continue
+                bench_df = normalize_date_index(pd.DataFrame(series), value_col="총자산", new_name=name)
+                chart_df = chart_df.join(bench_df, how="outer")
+
+            st.line_chart(chart_df)
+
+            st.subheader("벤치마크 대비 알파")
+            for name, series in result["benchmarks"].items():
+                final_bench = series[-1]["총자산"]
+                if final_bench is None:
+                    st.caption(f"{name}: 데이터 부족으로 비교 불가")
+                    continue
+                bench_return = (final_bench - result["initial_amount"]) / result["initial_amount"] * 100
+                alpha = result["final_return"] - bench_return
+                arrow = "▲" if alpha >= 0 else "▼"
+                color = "green" if alpha >= 0 else "red"
+                st.markdown(f"**{name}**: {bench_return:+.2f}% · :{color}[알파 {arrow} {alpha:+.2f}%p]")
+
+            with st.expander("월별 상세 내역"):
+                detail_df = pd.DataFrame(result["portfolio"])
+                st.dataframe(detail_df, use_container_width=True, hide_index=True)
+
+        n_comparison = st.session_state.get("_backtest_n_comparison")
+        if n_comparison:
+            st.divider()
+            st.subheader(f"📊 종목 수별 비교: {st.session_state.get('_backtest_preset_name')}")
+
+            # 종목 수별 최종수익률 요약 표 (최종 자산은 콤마 포맷)
+            summary_rows = []
+            series_map = {}
+            for n, res in sorted(n_comparison.items()):
+                summary_rows.append({
+                    "종목 수": n,
+                    "최종 자산": f"{res['final_value']:,.0f}",
+                    "총 수익률(%)": round(res["final_return"], 2)
+                })
+                series_map[n] = normalize_date_index(pd.DataFrame(res["portfolio"]), value_col="총자산", new_name=f"{n}개 종목")
+
+            st.dataframe(pd.DataFrame(summary_rows), use_container_width=True, hide_index=True)
+
+            st.caption("그래프에 표시할 종목 수 선택")
+            n_toggle_cols = st.columns(len(series_map))
+            selected_n_values = {}
+            for i, n in enumerate(sorted(series_map.keys())):
+                selected_n_values[n] = n_toggle_cols[i].checkbox(f"{n}개", value=True, key=f"bt_compare_n_toggle_{n}")
+
+            chart_df = None
+            for n in sorted(series_map.keys()):
+                if not selected_n_values.get(n):
+                    continue
+                chart_df = series_map[n] if chart_df is None else chart_df.join(series_map[n], how="outer")
+
+            # 벤치마크는 종목 수와 무관하게 동일하므로, 첫 번째 결과의 것을 재사용
+            first_result = list(n_comparison.values())[0]
+            st.caption("그래프에 표시할 벤치마크 선택")
+            bench_toggle_cols2 = st.columns(len(first_result["benchmarks"]))
+            selected_benches_compare = {}
+            for i, name in enumerate(first_result["benchmarks"].keys()):
+                selected_benches_compare[name] = bench_toggle_cols2[i].checkbox(
+                    name, value=True, key=f"bt_compare_bench_{name}"
+                )
+
+            for name, series in first_result["benchmarks"].items():
+                if not selected_benches_compare.get(name):
+                    continue
+                bench_df = normalize_date_index(pd.DataFrame(series), value_col="총자산", new_name=name)
+                chart_df = bench_df if chart_df is None else chart_df.join(bench_df, how="outer")
+
+            if chart_df is not None and len(chart_df.columns) > 0:
+                st.line_chart(chart_df)
+            else:
+                st.info("표시할 항목을 하나 이상 선택해주세요.")
+
+            st.subheader("벤치마크 대비 알파 (종목 수별)")
+            alpha_rows = []
+            for n, res in sorted(n_comparison.items()):
+                row = {"종목 수": n, "총 수익률(%)": round(res["final_return"], 2)}
+                for name, series in res["benchmarks"].items():
+                    final_bench = series[-1]["총자산"]
+                    if final_bench is None:
+                        row[f"알파_{name}"] = None
+                        continue
+                    bench_return = (final_bench - res["initial_amount"]) / res["initial_amount"] * 100
+                    row[f"알파_{name}"] = round(res["final_return"] - bench_return, 2)
+                alpha_rows.append(row)
+            st.dataframe(pd.DataFrame(alpha_rows), use_container_width=True, hide_index=True)
+
+            st.caption("💡 종목 수를 줄일수록 수익률이 계속 좋아진다면, 이 전략은 '소수의 대박 종목'에 의존하는 저격형일 가능성이 높습니다. "
+                       "종목 수를 바꿔도 수익률이 비슷하다면, 더 폭넓게 통하는 전략이라는 뜻입니다.")
