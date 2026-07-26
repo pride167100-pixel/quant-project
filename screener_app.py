@@ -825,7 +825,7 @@ else:
                 st.markdown(f"**{name}**: {bench_return:+.2f}% · :{color}[알파 {arrow} {alpha:+.2f}%p]")
 
             with st.expander("월별 상세 내역"):
-                detail_df = pd.DataFrame(result["portfolio"])
+                detail_df = format_currency_cols(pd.DataFrame(result["portfolio"]), ["총자산", "현금"])
                 st.dataframe(detail_df, use_container_width=True, hide_index=True)
 
         n_comparison = st.session_state.get("_backtest_n_comparison")
@@ -895,3 +895,9 @@ else:
 
             st.caption("💡 종목 수를 줄일수록 수익률이 계속 좋아진다면, 이 전략은 '소수의 대박 종목'에 의존하는 저격형일 가능성이 높습니다. "
                        "종목 수를 바꿔도 수익률이 비슷하다면, 더 폭넓게 통하는 전략이라는 뜻입니다.")
+
+            st.subheader("종목 수별 월별 보유 종목 상세")
+            for n, res in sorted(n_comparison.items()):
+                with st.expander(f"📦 {n}개 종목 기준 - 월별 보유 내역"):
+                    detail_df = format_currency_cols(pd.DataFrame(res["portfolio"]), ["총자산", "현금"])
+                    st.dataframe(detail_df, use_container_width=True, hide_index=True)
