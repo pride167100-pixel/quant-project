@@ -23,15 +23,11 @@ def get_financials(corp_code, bsns_year="2025", reprt_code="11011", fs_div="CFS"
 
 
 if __name__ == "__main__":
-    # 삼성전자 고유번호 (00126380)로 테스트
     data = get_financials("00126380")
     items = data.get("list", [])
 
-    op_income_items = [item for item in items if item.get("account_nm") == "영업이익" and item.get("sj_div") == "IS"]
-
-    if op_income_items:
-        print("=== 영업이익 항목의 전체 필드 ===")
-        for key, val in op_income_items[0].items():
-            print(f"  {key}: {val}")
-    else:
-        print("영업이익 항목을 찾지 못했습니다. 응답 상태:", data.get("status"), data.get("message"))
+    # 손익계산서(IS) 전체 계정과목 이름을 다 출력
+    print("=== 손익계산서(IS) 전체 계정과목 ===")
+    for item in items:
+        if item.get("sj_div") == "IS":
+            print(item.get("account_nm"))
