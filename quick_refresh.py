@@ -6,8 +6,8 @@ EPS/BPS는 재무 새로고침(full_refresh.py) 때의 값을 그대로 사용�
 import kis_batch_refresh
 
 
-def main():
-    return kis_batch_refresh.main()
+def main(progress_callback=None):
+    return kis_batch_refresh.main(progress_callback=progress_callback)
 
 
 if __name__ == "__main__":

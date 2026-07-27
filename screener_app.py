@@ -1,6 +1,7 @@
 import streamlit as st
 import pandas as pd
 import json
+import auth_manager as auth
 import portfolio_db as db
 import kis_realtime as kis
 import benchmark_prices as bp
@@ -11,9 +12,202 @@ from screener_logic import (
     filter_stocks, summarize_criteria, summarize_criteria_lines, rank_stocks
 )
 
-db.init_db()
-
 st.set_page_config(page_title="퀀트 스크리너", layout="wide")
+
+
+# ══════════════════════════════════════════════════════════
+# 인증 + 모드 선택 게이트 (통과해야 아래 실제 앱이 실행됨)
+# ══════════════════════════════════════════════════════════
+
+def render_setup_screen():
+    st.title("🔐 처음 오셨네요 - API 설정")
+    st.markdown("이 프로그램은 **본인 명의의 API 키**로 작동합니다. 아래 안내를 따라 발급받아 입력해주세요.")
+
+    with st.expander("📖 API 키 발급받는 방법 (처음이시면 꼭 읽어주세요)", expanded=True):
+        st.markdown("""
+**1) 한국투자증권(KIS) — 실전투자 앱키·시크릿·계좌번호**
+
+1. [KIS Developers 포털](https://apiportal.koreainvestment.com) 접속
+2. 보유하신 한투 계좌 로그인 정보로 로그인 (로그인이 안 되면 한투 고객센터 ☎1544-5000 문의)
+3. "API 신청하기" 클릭 → **실전투자계좌** 체크 → 계좌번호 선택 → 비밀번호 입력 → 인증
+4. 발급된 **APP Key**, **APP Secret**을 복사해서 아래에 입력
+
+**2) DART(전자공시시스템) — 인증키**
+
+1. [OPEN DART](https://opendart.fss.or.kr) 접속 (KIS와 별개로, 본인 이메일로 새로 가입)
+2. 회원가입 (이메일 인증만 하면 됨, 증권계좌 불필요)
+3. 상단 메뉴 "인증키 신청/관리" → 인증키 신청 (이용목적: "개인 투자 참고용 프로그램 개발" 정도로 작성)
+4. 발급된 **인증키**를 복사해서 아래에 입력
+        """)
+
+    st.subheader("API 키 입력")
+    kis_app_key = st.text_input("한투 APP Key", type="password", key="setup_kis_app_key")
+    kis_app_secret = st.text_input("한투 APP Secret", type="password", key="setup_kis_app_secret")
+    kis_account_no = st.text_input("한투 계좌번호 (숫자만, 예: 12345678)", key="setup_kis_account_no")
+    dart_api_key = st.text_input("DART 인증키", type="password", key="setup_dart_api_key")
+
+    current_keys_tuple = (kis_app_key, kis_app_secret, dart_api_key)
+
+    if st.button("🔍 인증키 확인", type="primary"):
+        if not all([kis_app_key, kis_app_secret, kis_account_no, dart_api_key]):
+            st.error("API 키 4개를 모두 입력해주세요.")
+        else:
+            with st.spinner("한투 · DART 서버에 실제로 접속해서 확인하는 중..."):
+                ok, msg = auth.verify_all_credentials(kis_app_key, kis_app_secret, dart_api_key)
+            st.session_state["_verify_result"] = ok
+            st.session_state["_verify_message"] = msg
+            st.session_state["_verified_keys"] = current_keys_tuple
+
+    # 키를 검증 이후에 바꿨다면, 검증 결과를 무효화 (다시 확인하도록 유도)
+    keys_changed_since_verify = st.session_state.get("_verified_keys") != current_keys_tuple
+    verified_ok = st.session_state.get("_verify_result", False) and not keys_changed_since_verify
+
+    if st.session_state.get("_verify_message") and not keys_changed_since_verify:
+        if st.session_state["_verify_result"]:
+            st.success(st.session_state["_verify_message"])
+        else:
+            st.error(st.session_state["_verify_message"])
+    elif keys_changed_since_verify and st.session_state.get("_verify_message"):
+        st.warning("키 입력값이 바뀌었습니다. '인증키 확인'을 다시 눌러주세요.")
+
+    st.divider()
+    st.subheader("비밀번호 설정")
+    st.caption("프로그램을 켤 때마다 입력할 비밀번호입니다. 같은 컴퓨터를 쓰는 다른 사람으로부터의 "
+               "가벼운 보호 목적이며, 강력한 보안 장치는 아닙니다.")
+    password1 = st.text_input("비밀번호", type="password", key="setup_password1")
+    password2 = st.text_input("비밀번호 확인", type="password", key="setup_password2")
+
+    if not verified_ok:
+        st.info("먼저 위에서 '인증키 확인'을 통과해야 저장할 수 있습니다.")
+
+    if st.button("저장하고 시작하기", type="primary", disabled=not verified_ok):
+        if not password1:
+            st.error("비밀번호를 입력해주세요.")
+        elif password1 != password2:
+            st.error("비밀번호가 서로 다릅니다.")
+        elif len(password1) < 4:
+            st.error("비밀번호는 4자 이상으로 설정해주세요.")
+        else:
+            auth.save_credentials(kis_app_key, kis_app_secret, kis_account_no, dart_api_key, password1)
+            st.success("저장 완료! 다시 시작합니다...")
+            st.session_state["_authenticated"] = True
+            st.rerun()
+
+
+def render_login_screen():
+    st.title("🔒 로그인")
+
+    with st.form("login_form"):
+        password = st.text_input("비밀번호", type="password")
+        col1, col2 = st.columns(2)
+        with col1:
+            login_clicked = st.form_submit_button("로그인", type="primary", use_container_width=True)
+        with col2:
+            reset_clicked = st.form_submit_button("API 재설정", use_container_width=True)
+
+    if login_clicked:
+        if auth.verify_password(password):
+            st.session_state["_authenticated"] = True
+            st.rerun()
+        else:
+            st.error("비밀번호가 틀렸습니다.")
+
+    if reset_clicked:
+        st.session_state["_show_api_reset"] = True
+
+    if st.session_state.get("_show_api_reset"):
+        render_api_reset_section()
+
+
+def render_api_reset_section():
+    """API 키 재설정 폼. 로그인 화면과 모드 선택 화면 양쪽에서 재사용됨"""
+    st.divider()
+    st.subheader("API 키 재설정")
+    st.caption("비밀번호는 그대로 유지되고, API 키만 새로 바뀝니다.")
+    current = auth.get_current_keys()
+
+    new_app_key = st.text_input("한투 APP Key", value=current["kis_app_key"], type="password", key="reset_app_key")
+    new_app_secret = st.text_input("한투 APP Secret", value=current["kis_app_secret"], type="password", key="reset_app_secret")
+    new_account_no = st.text_input("한투 계좌번호", value=current["kis_account_no"], key="reset_account_no")
+    new_dart_key = st.text_input("DART 인증키", value=current["dart_api_key"], type="password", key="reset_dart_key")
+
+    reset_keys_tuple = (new_app_key, new_app_secret, new_dart_key)
+
+    if st.button("🔍 인증키 확인", key="reset_verify_btn"):
+        with st.spinner("한투 · DART 서버에 실제로 접속해서 확인하는 중..."):
+            ok, msg = auth.verify_all_credentials(new_app_key, new_app_secret, new_dart_key)
+        st.session_state["_reset_verify_result"] = ok
+        st.session_state["_reset_verify_message"] = msg
+        st.session_state["_reset_verified_keys"] = reset_keys_tuple
+
+    reset_keys_changed = st.session_state.get("_reset_verified_keys") != reset_keys_tuple
+    reset_verified_ok = st.session_state.get("_reset_verify_result", False) and not reset_keys_changed
+
+    if st.session_state.get("_reset_verify_message") and not reset_keys_changed:
+        if st.session_state["_reset_verify_result"]:
+            st.success(st.session_state["_reset_verify_message"])
+        else:
+            st.error(st.session_state["_reset_verify_message"])
+    elif reset_keys_changed and st.session_state.get("_reset_verify_message"):
+        st.warning("키 입력값이 바뀌었습니다. '인증키 확인'을 다시 눌러주세요.")
+
+    if st.button("API 키 업데이트", type="primary", disabled=not reset_verified_ok, key="reset_submit_btn"):
+        auth.update_api_keys_only(new_app_key, new_app_secret, new_account_no, new_dart_key)
+        st.success("API 키가 업데이트되었습니다.")
+        st.session_state["_show_api_reset"] = False
+        st.rerun()
+
+
+def render_mode_selection():
+    st.title("📈 모드 선택")
+    st.caption("어떤 모드로 시작하시겠어요?")
+
+    col1, col2 = st.columns(2)
+    with col1:
+        with st.container(border=True):
+            st.subheader("🧪 모의매매")
+            st.write("가상의 자금으로 스크리닝, 백테스트, 모의 매수/매도를 체험합니다.")
+            if st.button("모의매매 시작", type="primary", use_container_width=True):
+                st.session_state["_trade_mode"] = "모의매매"
+                st.rerun()
+    with col2:
+        with st.container(border=True):
+            st.subheader("💰 실전매매")
+            st.write("실제 증권계좌로 주문을 실행합니다.")
+            if st.button("실전매매 시작", use_container_width=True):
+                st.session_state["_trade_mode"] = "실전매매"
+                st.rerun()
+
+    st.divider()
+    with st.expander("⚙️ API 키 재설정"):
+        render_api_reset_section()
+
+
+if not auth.is_configured():
+    render_setup_screen()
+    st.stop()
+
+if not st.session_state.get("_authenticated"):
+    render_login_screen()
+    st.stop()
+
+if st.session_state.get("_trade_mode") is None:
+    render_mode_selection()
+    st.stop()
+
+if st.session_state["_trade_mode"] == "실전매매":
+    st.title("💰 실전매매")
+    st.info("아직 준비 중입니다. 모의매매로 충분히 검증한 뒤 추가될 예정이에요.")
+    if st.button("← 모드 선택으로 돌아가기"):
+        st.session_state["_trade_mode"] = None
+        st.rerun()
+    st.stop()
+
+# ══════════════════════════════════════════════════════════
+# 여기서부터는 "모의매매" 모드로 확정된 상태에서만 실행됨
+# ══════════════════════════════════════════════════════════
+
+db.init_db()
 
 # ── 지표 설명 (도움말 툴팁용) ──────────────────────────────
 HELP_TEXT = {
@@ -72,6 +266,9 @@ def gather_current_criteria():
         result[use_key] = st.session_state.get(use_key, False)
         result[f"{key}_slider"] = st.session_state.get(f"{key}_slider")
     result["use_3year_profit"] = st.session_state.get("use_3year_profit", False)
+    result["mode"] = "랭킹 모드" if st.session_state.get("scr_use_ranking", False) else "필터 모드"
+    result["ranking_labels"] = st.session_state.get("scr_ranking_labels", [])
+    result["top_n"] = st.session_state.get("scr_top_n", 20)
     return result
 
 
@@ -85,6 +282,12 @@ def apply_criteria_to_state(criteria):
             st.session_state[f"{key}_num"] = criteria[f"{key}_slider"]
     if "use_3year_profit" in criteria:
         st.session_state["use_3year_profit"] = criteria["use_3year_profit"]
+    if "mode" in criteria:
+        st.session_state["scr_use_ranking"] = (criteria["mode"] == "랭킹 모드")
+    if "ranking_labels" in criteria:
+        st.session_state["scr_ranking_labels"] = criteria["ranking_labels"]
+    if "top_n" in criteria:
+        st.session_state["scr_top_n"] = criteria["top_n"]
 
 
 def normalize_date_index(df, date_col="날짜", value_col="총자산", new_name=None):
@@ -157,6 +360,9 @@ def reset_criteria_to_defaults():
         st.session_state[f"{key}_slider"] = default_val
         st.session_state[f"{key}_num"] = default_val
     st.session_state["use_3year_profit"] = False
+    st.session_state["scr_use_ranking"] = False
+    st.session_state["scr_ranking_labels"] = []
+    st.session_state["scr_top_n"] = 20
     st.session_state.pop("select_all_results", None)
     st.session_state.pop("result_editor", None)
     st.session_state.pop("select_all_holdings", None)
@@ -174,6 +380,9 @@ df = load_data()
 # 사이드바: 화면 전환 + 프리셋 선택
 # ══════════════════════════════════════════════════════════
 st.sidebar.title("메뉴")
+if st.sidebar.button("🔄 모드 변경"):
+    st.session_state["_trade_mode"] = None
+    st.rerun()
 st.sidebar.caption(f"📅 데이터 기준: {get_data_timestamp()}")
 
 page = st.sidebar.radio("화면 선택", ["스크리너 & 모의매매", "프리셋 비교", "백테스터"])
@@ -260,8 +469,13 @@ if page == "스크리너 & 모의매매":
 
     if st.sidebar.button("⚡ 빠른 새로고침 (현재가·PER·PBR, ~1분)"):
         import kis_batch_refresh
-        with st.spinner("현재가/PER/PBR 갱신 중... (약 1~2분)"):
-            result = kis_batch_refresh.main()
+        quick_progress = st.sidebar.progress(0.0, text="빠른 새로고침 준비 중...")
+
+        def _quick_progress_cb(step, total):
+            quick_progress.progress(step / total, text=f"빠른 새로고침 중... ({step}/{total}배치)")
+
+        result = kis_batch_refresh.main(progress_callback=_quick_progress_cb)
+        quick_progress.empty()
         st.sidebar.success(f"완료! {result['success_count']}/{result['total']}개 갱신 "
                             f"({result['elapsed_sec']:.0f}초)")
         st.cache_data.clear()
@@ -272,20 +486,32 @@ if page == "스크리너 & 모의매매":
                    "시간이 오래 걸리니 실행 중 페이지를 닫지 마세요.")
         if st.button("재무 데이터 새로고침 시작"):
             import full_refresh
-            with st.spinner("전체 데이터 갱신 중... 최대 1.5시간 정도 걸릴 수 있습니다."):
-                result = full_refresh.main()
+            full_progress = st.progress(0.0, text="재무 데이터 새로고침 준비 중...")
+
+            step_labels = {
+                "universe": "시세·PBR·PER·EPS·BPS", "momentum": "모멘텀·거래대금",
+                "sector": "업종 정보", "growth": "재무제표(성장률 등)",
+                "company": "회사개요", "merge": "최종 병합",
+            }
+
+            def _full_progress_cb(overall, step_name):
+                label = step_labels.get(step_name, step_name)
+                full_progress.progress(overall, text=f"재무 데이터 새로고침 중... {label} ({overall*100:.0f}%)")
+
+            result = full_refresh.main(progress_callback=_full_progress_cb)
+            full_progress.empty()
             st.sidebar.success(f"완료! 총 {result['elapsed_sec']/60:.1f}분 소요")
             st.cache_data.clear()
             st.rerun()
 
     st.divider()
 
-    mode = st.radio(
-        "모드 선택", ["필터 모드", "랭킹 모드"], horizontal=True,
-        help="필터 모드: 조건을 만족하는 종목을 전부 찾습니다.\n\n"
-             "랭킹 모드: 아래 조건으로 1차로 거른 뒤, 선택한 지표들의 순위를 합산해 상위 N개만 뽑습니다 (마법공식 방식)."
+    use_ranking_toggle = st.checkbox(
+        "결과를 정렬해서 상위 N개만 보기 (랭킹)", key="scr_use_ranking",
+        help="꺼두면: 아래 조건을 만족하는 종목을 전부 보여줍니다.\n\n"
+             "켜두면: 조건을 만족하는 종목들 중, 선택한 지표들의 순위를 합산해 상위 N개만 정렬해서 보여줍니다 (마법공식 방식)."
     )
-    st.caption("아래 탭의 조건은 두 모드 모두에서 '1차 필터'로 적용됩니다.")
+    st.caption("아래 탭의 조건은 필터로 항상 적용됩니다. 랭킹은 그 결과를 정렬해서 상위 N개만 추려주는 추가 옵션입니다.")
 
     tab1, tab2, tab3, tab4, tab5 = st.tabs(
         ["가치 (Value)", "퀄리티 (Quality)", "성장 (Growth)", "규모 (Size)", "모멘텀 (Momentum)"]
@@ -355,43 +581,44 @@ if page == "스크리너 & 모의매매":
 
     rank_cols_for_display = []
 
-    if mode == "필터 모드":
-        filtered = hard_filtered
-        st.subheader(f"📊 {preset_name} (필터 모드)")
-        col1, col2 = st.columns(2)
-        col1.metric("조건 통과 종목 수", f"{len(filtered)}개")
-        col2.metric("전체 대상", f"{len(df)}개")
-    else:
+    if use_ranking_toggle:
         st.subheader("🏆 랭킹 설정")
         indicator_labels = [label for label, _, _ in RANKING_INDICATORS]
         default_labels = [l for l in indicator_labels if l.startswith(("PER", "PBR", "ROE"))]
         selected_labels = st.multiselect(
-            "랭킹에 사용할 지표 (순위를 합산합니다)", indicator_labels, default=default_labels
+            "랭킹에 사용할 지표 (순위를 합산합니다)", indicator_labels, default=default_labels,
+            key="scr_ranking_labels"
         )
-        top_n = st.number_input("상위 몇 개를 추출할까요?", min_value=1, max_value=200, value=20, step=1)
+        top_n = st.number_input("상위 몇 개를 추출할까요?", min_value=1, max_value=200, value=20, step=1, key="scr_top_n")
 
-        st.caption(f"1차 필터 통과 종목({len(hard_filtered)}개) 중, 선택한 지표가 전부 존재하는 종목만 랭킹에 포함됩니다.")
+        st.caption(f"필터 통과 종목({len(hard_filtered)}개) 중, 선택한 지표가 전부 존재하는 종목만 랭킹에 포함됩니다.")
 
         filtered, rank_cols_for_display = rank_stocks(hard_filtered, selected_labels, top_n)
 
-        st.subheader(f"📊 {preset_name} (랭킹 모드 - 상위 {len(filtered)}개)")
+        st.subheader(f"📊 {preset_name} (정렬 상위 {len(filtered)}개)")
         col1, col2, col3 = st.columns(3)
-        col1.metric("1차 필터 통과", f"{len(hard_filtered)}개")
+        col1.metric("필터 통과", f"{len(hard_filtered)}개")
         col2.metric("최종 추출", f"{len(filtered)}개")
         col3.metric("전체 대상", f"{len(df)}개")
         st.caption("'최종순위'가 실제 등수(1등, 2등...)입니다. '합산순위'는 선택한 지표들의 순위를 더한 점수라 "
                    "종목마다 값이 다르며, 이 점수가 가장 낮은 종목이 최종순위 1등이 됩니다.")
+    else:
+        filtered = hard_filtered
+        st.subheader(f"📊 {preset_name}")
+        col1, col2 = st.columns(2)
+        col1.metric("조건 통과 종목 수", f"{len(filtered)}개")
+        col2.metric("전체 대상", f"{len(df)}개")
 
     display_cols = ["종목코드", "종목명", "업종명", "시장구분", "현재가", "PBR", "PER", "ROE",
                      "부채비율(%)", "유동비율(%)", "매출액성장률(%)", "영업이익성장률(%)", "3년연속흑자",
                      "3개월수익률(%)", "6개월수익률(%)", "12개월수익률(%)",
                      "시가총액", "평균거래대금(억원)"]
-    if mode == "랭킹 모드":
+    if use_ranking_toggle:
         display_cols = ["최종순위", "합산순위"] + display_cols
     display_cols = [c for c in display_cols if c in filtered.columns]
 
-    sort_col = "최종순위" if mode == "랭킹 모드" else "시가총액"
-    sort_asc = True if mode == "랭킹 모드" else False
+    sort_col = "최종순위" if use_ranking_toggle else "시가총액"
+    sort_asc = True if use_ranking_toggle else False
     result_view = filtered[display_cols].sort_values(sort_col, ascending=sort_asc).reset_index(drop=True)
 
     select_all_results = st.checkbox("전체 선택", key="select_all_results",
@@ -699,6 +926,16 @@ else:
         col1, col2, col3 = st.columns(3)
         with col1:
             bt_preset = st.selectbox("백테스트할 프리셋", saved_presets, key="bt_preset_select")
+
+        # 프리셋을 바꿨을 때만, 그 프리셋에 저장된 랭킹모드 설정을 자동으로 불러옴
+        if st.session_state.get("_loaded_bt_preset") != bt_preset:
+            preset_criteria = db.load_preset_criteria(bt_preset)
+            if preset_criteria:
+                st.session_state["bt_use_ranking"] = (preset_criteria.get("mode") == "랭킹 모드")
+                st.session_state["bt_ranking_indicators"] = preset_criteria.get("ranking_labels", [])
+                st.session_state["bt_top_n"] = preset_criteria.get("top_n", 20)
+            st.session_state["_loaded_bt_preset"] = bt_preset
+
         with col2:
             months_option = st.selectbox(
                 "시작 시점", [3, 6, 12, 24, 36],

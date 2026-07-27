@@ -39,11 +39,18 @@ def to_number(val):
 
 
 def get_financials(corp_code, bsns_year, reprt_code):
-    """당기(요청연도)/전기(요청연도-1) 2개 기간의 재무데이터 추출"""
+    """당기(요청연도)/전기(요청연도-1) 2개 기간의 재무데이터 추출.
+    반기(11012)/3분기(11014) 보고서는 손익계산서 항목에 '해당분기 단독' 값과 '연초누적' 값이
+    따로 있는데, thstrm_add_amount가 누적값이라 이걸 써야 함 (1분기/연간은 이 구분이 없어 그대로 사용)"""
     url = "https://opendart.fss.or.kr/api/fnlttSinglAcnt.json"
     Y = int(bsns_year)
     years = [Y, Y - 1]
-    period_keys = ["thstrm_amount", "frmtrm_amount"]
+
+    use_cumulative = reprt_code in ("11012", "11014")
+    if use_cumulative:
+        period_keys = ["thstrm_add_amount", "frmtrm_add_amount"]
+    else:
+        period_keys = ["thstrm_amount", "frmtrm_amount"]
 
     for fs_div in ["CFS", "OFS"]:
         params = {
@@ -66,8 +73,12 @@ def get_financials(corp_code, bsns_year, reprt_code):
 
                 if sj == "IS" and raw_name in IS_TARGETS:
                     clean_name = IS_TARGETS[raw_name]
+                    # 재무상태표(BS)가 아닌 손익계산서(IS) 항목만 누적/단독 구분이 있음
+                    this_period_keys = period_keys
                 elif sj == "BS" and raw_name in BS_TARGETS:
                     clean_name = BS_TARGETS[raw_name]
+                    # 재무상태표는 특정 시점의 잔액이라 누적/단독 구분 자체가 없음 (항상 thstrm_amount)
+                    this_period_keys = ["thstrm_amount", "frmtrm_amount"]
                 else:
                     continue
 
@@ -75,7 +86,7 @@ def get_financials(corp_code, bsns_year, reprt_code):
                     continue
                 seen_keys.add(clean_name)
 
-                for year, pkey in zip(years, period_keys):
+                for year, pkey in zip(years, this_period_keys):
                     val = to_number(item.get(pkey))
                     if val is not None:
                         found_any = True

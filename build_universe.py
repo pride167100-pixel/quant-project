@@ -55,7 +55,7 @@ def get_price_info(token, stock_code):
 
 
 # ── 3. 전체 종목 순회 ────────────────────────────────────
-def main():
+def main(progress_callback=None):
     universe = pd.read_csv("all_stocks.csv", dtype={"종목코드": str})
     print(f"대상 종목 수: {len(universe)}")
 
@@ -73,6 +73,8 @@ def main():
         # 진행상황 표시 (100개마다)
         if (idx + 1) % 100 == 0 or (idx + 1) == total:
             print(f"진행: {idx + 1} / {total}")
+        if progress_callback:
+            progress_callback(idx + 1, total)
 
         # 중간 저장 (500개마다 체크포인트 — 중간에 끊겨도 복구 가능)
         if (idx + 1) % 500 == 0:

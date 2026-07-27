@@ -76,7 +76,7 @@ def chunked(lst, size):
         yield lst[i:i + size]
 
 
-def main():
+def main(progress_callback=None):
     start_time = datetime.now()
     print("시작 시각:", start_time.strftime("%H:%M:%S"))
 
@@ -94,6 +94,8 @@ def main():
         all_prices.update(result)
         if (i + 1) % 20 == 0 or (i + 1) == len(chunks):
             print(f"진행: {i + 1} / {len(chunks)} 배치")
+        if progress_callback:
+            progress_callback(i + 1, len(chunks))
         time.sleep(0.07)  # 초당 20건 제한 대비 여유
 
     # 새 가격 반영 + EPS/BPS는 기존 값 그대로 사용해 PER/PBR 재계산

@@ -88,7 +88,7 @@ def calc_momentum(weekly_data):
     }
 
 
-def main():
+def main(progress_callback=None):
     start_time = datetime.now()
     print("시작 시각:", start_time.strftime("%H:%M:%S"))
 
@@ -110,6 +110,8 @@ def main():
 
         if (idx + 1) % 100 == 0 or (idx + 1) == total:
             print(f"진행: {idx + 1} / {total}")
+        if progress_callback:
+            progress_callback(idx + 1, total)
 
         if (idx + 1) % 500 == 0:
             temp = pd.concat([stocks.iloc[:idx + 1][["종목코드"]].reset_index(drop=True),

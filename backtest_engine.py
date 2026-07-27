@@ -26,7 +26,7 @@ def get_fiscal_year_asof(target_date):
 
 
 def load_backtest_data():
-    """백테스트에 필요한 3개 파일을 미리 로드 (반복 사용을 위해 한 번만)"""
+    """백테스트에 필요한 파일들을 미리 로드 (반복 사용을 위해 한 번만)"""
     static_info = pd.read_csv("screener_data.csv", dtype={"종목코드": str})[
         ["종목코드", "종목명", "업종명", "시장구분", "상장주수"]
     ]
@@ -34,11 +34,20 @@ def load_backtest_data():
     prices = pd.read_csv("historical_prices.csv", dtype={"종목코드": str})
     prices["날짜"] = pd.to_datetime(prices["날짜"], format="%Y%m%d")
     prices = prices.sort_values(["종목코드", "날짜"]).reset_index(drop=True)
-    return static_info, financials, prices
+
+    try:
+        timeline = pd.read_csv("financial_timeline.csv", dtype={"종목코드": str})
+        timeline["공시일_추정"] = pd.to_datetime(timeline["공시일_추정"])
+        timeline = timeline.sort_values("공시일_추정").reset_index(drop=True)
+    except FileNotFoundError:
+        timeline = None  # 없으면 예전 방식(연간 근사)으로 자동 대체
+
+    return static_info, financials, prices, timeline
 
 
 def get_price_asof(prices, stock_code, target_date, tolerance_days=21):
-    """특정 종목의 target_date 이전(또는 당일) 가장 가까운 종가를 반환. tolerance_days 넘게 오래된 데이터면 None"""
+    """특정 종목의 target_date 이전(또는 당일) 가장 가까운 종가를 반환. tolerance_days 넘게 오래된 데이터면 None
+    (단일 종목 조회용. 대량 조회는 merge_asof_prices()가 훨씬 빠름)"""
     sub = prices[(prices["종목코드"] == stock_code) & (prices["날짜"] <= target_date)]
     if sub.empty:
         return None
@@ -49,12 +58,13 @@ def get_price_asof(prices, stock_code, target_date, tolerance_days=21):
 
 
 def build_price_lookup(prices):
-    """종목코드별로 (날짜 오름차순 정렬된) 서브데이터프레임 딕셔너리를 미리 만들어 반복조회 속도 개선"""
+    """종목코드별로 (날짜 오름차순 정렬된) 서브데이터프레임 딕셔너리를 미리 만듦 (벤치마크 등 단건 조회용)"""
     return {code: g[["날짜", "종가", "거래대금"]].reset_index(drop=True)
             for code, g in prices.groupby("종목코드")}
 
 
 def fast_price_asof(price_lookup, stock_code, target_date, tolerance_days=21):
+    """단일 종목 조회용 (벤치마크처럼 종목이 몇 개 안 될 때 사용)"""
     sub = price_lookup.get(stock_code)
     if sub is None or sub.empty:
         return None
@@ -67,83 +77,133 @@ def fast_price_asof(price_lookup, stock_code, target_date, tolerance_days=21):
     return row["종가"]
 
 
-def build_historical_snapshot(target_date, static_info, financials, price_lookup):
-    """target_date 시점 기준의 전 종목 스냅샷을 만들어, 실시간 화면과 동일한 컬럼 형태로 반환"""
+def prepare_prices_for_vectorized(prices):
+    """merge_asof 벡터화 조회를 위해 가격 데이터를 준비.
+    종목별 최근 12주 평균거래대금(유동성)도 여기서 한 번만 미리 계산해둔다 (매번 재계산하면 느림)."""
+    prices = prices.sort_values(["종목코드", "날짜"]).copy()
+    prices["평균거래대금(억원)"] = (
+        prices.groupby("종목코드")["거래대금"]
+        .transform(lambda s: s.rolling(12, min_periods=1).mean())
+        / 5 / 1e8
+    )
+    # merge_asof는 전체가 '날짜' 기준 오름차순 정렬되어 있어야 함
+    return prices.sort_values("날짜").reset_index(drop=True)
+
+
+def merge_asof_prices(stock_codes, target_date, prices_sorted, value_cols=("종가",), tolerance_days=21):
+    """여러 종목의 target_date 시점 값을 한 번에(벡터로) 조회. 반복문 없이 처리해서 훨씬 빠름"""
+    target_df = pd.DataFrame({"종목코드": stock_codes, "__date__": target_date})
+    result = pd.merge_asof(
+        target_df, prices_sorted[["종목코드", "날짜"] + list(value_cols)],
+        left_on="__date__", right_on="날짜", by="종목코드",
+        direction="backward", tolerance=pd.Timedelta(days=tolerance_days)
+    )
+    return result[list(value_cols)]
+
+
+def merge_asof_timeline(stock_codes, target_date, timeline_sorted, tolerance_days=200):
+    """각 종목의 target_date 시점까지 '이미 공시된' 가장 최근 재무 실적을 한 번에(벡터로) 조회.
+    tolerance_days는 넉넉하게 잡음(연간보고서 발표 주기가 1년에 가까워서, 그 안에 최근 분기 실적이 있으면 됨)"""
+    value_cols = ["부채총계", "자본총계", "유동자산", "유동부채",
+                  "TTM_매출액", "TTM_영업이익", "TTM_당기순이익",
+                  "매출액성장률(%)", "영업이익성장률(%)"]
+    target_df = pd.DataFrame({"종목코드": stock_codes, "__date__": target_date})
+    result = pd.merge_asof(
+        target_df, timeline_sorted[["종목코드", "공시일_추정"] + value_cols],
+        left_on="__date__", right_on="공시일_추정", by="종목코드",
+        direction="backward", tolerance=pd.Timedelta(days=tolerance_days)
+    )
+    return result[value_cols]
+
+
+def build_historical_snapshot(target_date, static_info, financials, prices_sorted, timeline_sorted=None):
+    """target_date 시점 기준의 전 종목 스냅샷을 만들어, 실시간 화면과 동일한 컬럼 형태로 반환.
+    (merge_asof로 전 종목을 한 번에 조회하는 벡터화 버전 - 반복문 버전보다 훨씬 빠름)
+    timeline_sorted가 있으면(분기별 정밀데이터) 그걸로 ROE/PBR/PER/성장률을 정밀 계산하고,
+    없으면 예전 방식(연간 근사, 4월1일 공시 규칙)으로 자동 대체한다."""
     Y = get_fiscal_year_asof(target_date)
 
-    fin_cols_needed = [f"매출액_{Y}", f"매출액_{Y-1}", f"영업이익_{Y}", f"영업이익_{Y-1}", f"영업이익_{Y-2}",
-                       f"자본총계_{Y}", f"당기순이익_{Y}",
-                       f"ROE_{Y}", f"부채비율_{Y}", f"유동비율_{Y}"]
+    fin_cols_needed = [f"영업이익_{Y}", f"영업이익_{Y-1}", f"영업이익_{Y-2}"]
     available_cols = [c for c in fin_cols_needed if c in financials.columns]
     fin_slim = financials[["종목코드"] + available_cols].copy()
 
-    df = static_info.merge(fin_slim, on="종목코드", how="left")
+    df = static_info.merge(fin_slim, on="종목코드", how="left").reset_index(drop=True)
+    codes = df["종목코드"]
 
-    # 가격 관련 계산
-    def calc_row(row):
-        code = row["종목코드"]
-        price = fast_price_asof(price_lookup, code, target_date)
-        if price is None:
-            return pd.Series({"현재가": None, "시가총액": None, "PBR": None, "PER": None,
-                               "평균거래대금(억원)": None,
-                               "3개월수익률(%)": None, "6개월수익률(%)": None, "12개월수익률(%)": None})
+    # 현재가 + 유동성(12주 평균거래대금) - 한 번의 벡터 조회로 전 종목 처리
+    current = merge_asof_prices(codes, target_date, prices_sorted, value_cols=("종가", "평균거래대금(억원)"))
+    df["현재가"] = current["종가"]
+    df["평균거래대금(억원)"] = current["평균거래대금(억원)"].round(1)
 
-        # 주의: screener_data.csv의 '상장주수'는 '천주' 단위이므로 실제 주식수로 환산(×1000) 후 계산
-        market_cap = price * row["상장주수"] * 1000 / 1e8  # 억원 단위
+    # 3/6/12개월 전 가격도 각각 한 번씩의 벡터 조회로 처리 (반복문 없음)
+    p3 = merge_asof_prices(codes, target_date - relativedelta(months=3), prices_sorted, value_cols=("종가",))["종가"]
+    p6 = merge_asof_prices(codes, target_date - relativedelta(months=6), prices_sorted, value_cols=("종가",))["종가"]
+    p12 = merge_asof_prices(codes, target_date - relativedelta(months=12), prices_sorted, value_cols=("종가",))["종가"]
 
-        equity = row.get(f"자본총계_{Y}") if f"자본총계_{Y}" in row else None
-        net_income = row.get(f"당기순이익_{Y}") if f"당기순이익_{Y}" in row else None
+    df["3개월수익률(%)"] = ((df["현재가"] - p3) / p3 * 100).round(2)
+    df["6개월수익률(%)"] = ((df["현재가"] - p6) / p6 * 100).round(2)
+    df["12개월수익률(%)"] = ((df["현재가"] - p12) / p12 * 100).round(2)
 
-        pbr = (market_cap * 1e8) / equity if equity and equity != 0 else None
-        per = (market_cap * 1e8) / net_income if net_income and net_income != 0 else None
+    # 주의: screener_data.csv의 '상장주수'는 '천주' 단위이므로 실제 주식수로 환산(×1000) 후 계산
+    df["시가총액"] = (df["현재가"] * df["상장주수"] * 1000 / 1e8).round(1)
 
-        p3 = fast_price_asof(price_lookup, code, target_date - relativedelta(months=3))
-        p6 = fast_price_asof(price_lookup, code, target_date - relativedelta(months=6))
-        p12 = fast_price_asof(price_lookup, code, target_date - relativedelta(months=12))
+    if timeline_sorted is not None:
+        # ── 분기별 정밀 데이터 사용 (TTM 기준) ──
+        fin = merge_asof_timeline(codes, target_date, timeline_sorted)
 
-        mom3 = round((price - p3) / p3 * 100, 2) if p3 else None
-        mom6 = round((price - p6) / p6 * 100, 2) if p6 else None
-        mom12 = round((price - p12) / p12 * 100, 2) if p12 else None
+        equity_safe = fin["자본총계"].replace(0, np.nan)
+        net_income_safe = fin["TTM_당기순이익"].replace(0, np.nan)
 
-        sub = price_lookup.get(code)
-        avg_liquidity = None
-        if sub is not None and not sub.empty:
-            recent = sub[sub["날짜"] <= target_date].tail(12)
-            if not recent.empty:
-                avg_liquidity = round(recent["거래대금"].mean() / 5 / 1e8, 1)
-
-        return pd.Series({
-            "현재가": price, "시가총액": round(market_cap, 1),
-            "PBR": round(pbr, 2) if pbr else None, "PER": round(per, 2) if per else None,
-            "평균거래대금(억원)": avg_liquidity,
-            "3개월수익률(%)": mom3, "6개월수익률(%)": mom6, "12개월수익률(%)": mom12,
-        })
-
-    price_derived = df.apply(calc_row, axis=1)
-    df = pd.concat([df, price_derived], axis=1)
-
-    # ROE/부채비율/유동비율/성장률은 해당 연도 컬럼명을 표준 이름으로 매핑
-    df["ROE"] = df.get(f"ROE_{Y}")
-    df["부채비율(%)"] = df.get(f"부채비율_{Y}")
-    df["유동비율(%)"] = df.get(f"유동비율_{Y}")
-
-    if f"매출액_{Y}" in df.columns and f"매출액_{Y-1}" in df.columns:
-        df["매출액성장률(%)"] = ((df[f"매출액_{Y}"] - df[f"매출액_{Y-1}"]) / df[f"매출액_{Y-1}"].abs() * 100).round(2)
+        df["PBR"] = ((df["시가총액"] * 1e8) / equity_safe).round(2)
+        df["PER"] = ((df["시가총액"] * 1e8) / net_income_safe).round(2)
+        df["ROE"] = (fin["TTM_당기순이익"] / equity_safe * 100).round(2)
+        df["부채비율(%)"] = (fin["부채총계"] / equity_safe * 100).round(2)
+        df["유동비율(%)"] = (fin["유동자산"] / fin["유동부채"].replace(0, np.nan) * 100).round(2)
+        df["매출액성장률(%)"] = fin["매출액성장률(%)"]
+        df["영업이익성장률(%)"] = fin["영업이익성장률(%)"]
     else:
-        df["매출액성장률(%)"] = None
+        # ── 예전 방식(연간 근사, 데이터 없을 때 대체) ──
+        fin_cols_needed2 = [f"매출액_{Y}", f"매출액_{Y-1}", f"자본총계_{Y}", f"당기순이익_{Y}",
+                             f"ROE_{Y}", f"부채비율_{Y}", f"유동비율_{Y}"]
+        available2 = [c for c in fin_cols_needed2 if c in financials.columns]
+        fin_slim2 = financials[["종목코드"] + available2].copy()
+        df = df.merge(fin_slim2, on="종목코드", how="left")
 
-    if f"영업이익_{Y}" in df.columns and f"영업이익_{Y-1}" in df.columns:
-        df["영업이익성장률(%)"] = ((df[f"영업이익_{Y}"] - df[f"영업이익_{Y-1}"]) / df[f"영업이익_{Y-1}"].abs() * 100).round(2)
-    else:
-        df["영업이익성장률(%)"] = None
+        equity_col = f"자본총계_{Y}"
+        net_income_col = f"당기순이익_{Y}"
+        if equity_col in df.columns:
+            equity_safe = df[equity_col].replace(0, np.nan)
+            df["PBR"] = ((df["시가총액"] * 1e8) / equity_safe).round(2)
+        else:
+            df["PBR"] = None
+        if net_income_col in df.columns:
+            net_income_safe = df[net_income_col].replace(0, np.nan)
+            df["PER"] = ((df["시가총액"] * 1e8) / net_income_safe).round(2)
+        else:
+            df["PER"] = None
+
+        df["ROE"] = df.get(f"ROE_{Y}")
+        df["부채비율(%)"] = df.get(f"부채비율_{Y}")
+        df["유동비율(%)"] = df.get(f"유동비율_{Y}")
+
+        if f"매출액_{Y}" in df.columns and f"매출액_{Y-1}" in df.columns:
+            df["매출액성장률(%)"] = ((df[f"매출액_{Y}"] - df[f"매출액_{Y-1}"]) / df[f"매출액_{Y-1}"].abs() * 100).round(2)
+        else:
+            df["매출액성장률(%)"] = None
+
+        if f"영업이익_{Y}" in df.columns and f"영업이익_{Y-1}" in df.columns:
+            df["영업이익성장률(%)"] = ((df[f"영업이익_{Y}"] - df[f"영업이익_{Y-1}"]) / df[f"영업이익_{Y-1}"].abs() * 100).round(2)
+        else:
+            df["영업이익성장률(%)"] = None
 
     if all(f"영업이익_{y}" in df.columns for y in [Y, Y - 1, Y - 2]):
-        def check_3y(row):
-            vals = [row.get(f"영업이익_{Y}"), row.get(f"영업이익_{Y-1}"), row.get(f"영업이익_{Y-2}")]
-            if any(v is None or pd.isna(v) for v in vals):
-                return None
-            return bool(all(v > 0 for v in vals))
-        df["3년연속흑자"] = df.apply(check_3y, axis=1).astype("object")
+        cols = [f"영업이익_{Y}", f"영업이익_{Y-1}", f"영업이익_{Y-2}"]
+        all_present = df[cols].notna().all(axis=1)
+        all_positive = (df[cols] > 0).all(axis=1)
+        df["3년연속흑자"] = pd.Series(
+            [bool(p) if present else None for present, p in zip(all_present, all_positive)],
+            index=df.index, dtype="object"
+        )
     else:
         df["3년연속흑자"] = None
 
@@ -168,8 +228,9 @@ def run_backtest(criteria, months_back, initial_amount=10_000_000, progress_call
     ranking_indicators: rank_stocks에 넘길 지표 라벨 리스트 (screener_logic.RANKING_INDICATORS 참고)
     반환: {"portfolio": [...], "benchmarks": {...}, "final_return": float}
     """
-    static_info, financials, prices = load_backtest_data()
-    price_lookup = build_price_lookup(prices)
+    static_info, financials, prices, timeline = load_backtest_data()
+    prices_sorted = prepare_prices_for_vectorized(prices)  # 전종목 스냅샷용 (벡터화, 빠름)
+    price_lookup = build_price_lookup(prices)  # 보유/매매 종목처럼 소수 종목 조회용
     name_map = dict(zip(static_info["종목코드"], static_info["종목명"]))
 
     rebalance_dates = get_monthly_rebalance_dates(months_back)
@@ -180,7 +241,7 @@ def run_backtest(criteria, months_back, initial_amount=10_000_000, progress_call
     portfolio_history = []
 
     for step, target_date in enumerate(rebalance_dates):
-        snapshot = build_historical_snapshot(target_date, static_info, financials, price_lookup)
+        snapshot = build_historical_snapshot(target_date, static_info, financials, prices_sorted, timeline)
         passing = filter_stocks(snapshot, criteria)
 
         if use_ranking and ranking_indicators:
