@@ -380,6 +380,14 @@ df = load_data()
 # 사이드바: 화면 전환 + 프리셋 선택
 # ══════════════════════════════════════════════════════════
 st.sidebar.title("메뉴")
+if st.sidebar.button("🔴 프로그램 종료"):
+    st.sidebar.warning("프로그램을 종료합니다. 잠시 후 이 창을 닫으셔도 됩니다.")
+    import threading
+
+    def _shutdown():
+        os._exit(0)
+
+    threading.Timer(1.5, _shutdown).start()
 if st.sidebar.button("🔄 모드 변경"):
     st.session_state["_trade_mode"] = None
     st.rerun()
