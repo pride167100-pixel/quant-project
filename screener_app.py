@@ -902,131 +902,6 @@ if page == "스크리너 & 모의매매":
         col3.metric("총 자산", f"{total_asset:,.0f}원")
         col4.metric("총 수익률", f"{total_return:+.2f}%")
 
-    st.divider()
-    st.subheader("🔄 리밸런싱")
-    st.caption("이 프리셋에 **저장된 조건**(화면에서 지금 만지고 있는 슬라이더 값이 아니라 마지막으로 저장한 조건) 기준으로, "
-               "보유 종목 중 조건을 벗어난 건 팔고 새로 조건에 맞는 건 삽니다. 실행 전에 무엇을 팔고 살지 먼저 보여드리고, "
-               "체크 해제한 종목은 거래하지 않습니다.")
-
-    reb_portfolio = db.get_or_create_portfolio(preset_name)
-    last_reb = reb_portfolio.get("last_rebalanced_at")
-    if last_reb:
-        days_since = (datetime.now() - datetime.fromisoformat(last_reb)).days
-        st.caption(f"📅 마지막 리밸런싱: {last_reb[:10]} ({days_since}일 경과)")
-    else:
-        st.caption("📅 아직 리밸런싱을 실행한 적이 없습니다.")
-
-    if st.button("🔄 리밸런싱 대상 확인"):
-        reb_criteria = db.load_preset_criteria(preset_name)
-        if reb_criteria is None:
-            st.warning("이 프리셋은 아직 저장된 조건이 없습니다. 먼저 조건을 저장해주세요.")
-        else:
-            reb_matched = filter_stocks(df, reb_criteria)
-            if reb_criteria.get("mode") == "랭킹 모드" and reb_criteria.get("ranking_labels"):
-                reb_matched, _ = rank_stocks(reb_matched, reb_criteria["ranking_labels"], reb_criteria.get("top_n", 20))
-
-            reb_passing_codes = set(reb_matched["종목코드"])
-            reb_holdings_now = db.get_holdings(preset_name)
-            reb_current_codes = set(reb_holdings_now["stock_code"])
-
-            reb_to_sell = reb_holdings_now[reb_holdings_now["stock_code"].isin(reb_current_codes - reb_passing_codes)]
-            reb_to_buy = reb_matched[reb_matched["종목코드"].isin(reb_passing_codes - reb_current_codes)]
-
-            st.session_state["_rebalance_plan"] = {
-                "preset_name": preset_name,
-                "sell": reb_to_sell[["stock_code", "stock_name", "quantity"]].to_dict("records"),
-                "buy": reb_to_buy[["종목코드", "종목명", "현재가"]].to_dict("records"),
-            }
-            st.rerun()
-
-    reb_plan = st.session_state.get("_rebalance_plan")
-    if reb_plan and reb_plan["preset_name"] == preset_name:
-        if not reb_plan["sell"] and not reb_plan["buy"]:
-            st.success("✅ 이미 조건에 다 맞습니다. 리밸런싱할 대상이 없습니다.")
-            st.session_state.pop("_rebalance_plan", None)
-        else:
-            reb_price_map = df.set_index("종목코드")["현재가"].to_dict()
-
-            if reb_plan["sell"]:
-                st.markdown(f"**🔻 매도 예정 ({len(reb_plan['sell'])}개, 조건 이탈)**")
-                for item in reb_plan["sell"]:
-                    ref_price = reb_price_map.get(item["stock_code"])
-                    label = f"{item['stock_name']}({item['stock_code']}) {item['quantity']}주"
-                    if ref_price:
-                        label += f" · 약 {ref_price:,.0f}원"
-                    st.checkbox(label, value=True, key=f"reb_sell_{item['stock_code']}")
-
-            if reb_plan["buy"]:
-                st.markdown(f"**🔺 매수 예정 ({len(reb_plan['buy'])}개, 신규 조건 충족)**")
-                for item in reb_plan["buy"]:
-                    label = f"{item['종목명']}({item['종목코드']}) · 약 {item['현재가']:,.0f}원"
-                    st.checkbox(label, value=True, key=f"reb_buy_{item['종목코드']}")
-
-            st.caption("💡 체크 해제한 종목은 거래되지 않습니다. 매수 금액은 확정 시점의 현금을 체크된 매수 종목 수만큼 균등분배합니다.")
-
-            col_confirm, col_cancel = st.columns(2)
-            confirm_clicked = col_confirm.button("✅ 리밸런싱 확정", type="primary", key="reb_confirm_btn")
-            cancel_clicked = col_cancel.button("취소", key="reb_cancel_btn")
-
-            def _clear_rebalance_state(plan):
-                for item in plan["sell"]:
-                    st.session_state.pop(f"reb_sell_{item['stock_code']}", None)
-                for item in plan["buy"]:
-                    st.session_state.pop(f"reb_buy_{item['종목코드']}", None)
-                st.session_state.pop("_rebalance_plan", None)
-
-            if cancel_clicked:
-                _clear_rebalance_state(reb_plan)
-                st.rerun()
-
-            if confirm_clicked:
-                sell_items = [i for i in reb_plan["sell"] if st.session_state.get(f"reb_sell_{i['stock_code']}")]
-                buy_items = [i for i in reb_plan["buy"] if st.session_state.get(f"reb_buy_{i['종목코드']}")]
-
-                msgs = []
-                if sell_items:
-                    with st.spinner("매도 실시간 가격 조회 중..."):
-                        sell_rt = kis.get_realtime_prices([i["stock_code"] for i in sell_items])
-                    sell_orders = []
-                    for i in sell_items:
-                        price = sell_rt.get(i["stock_code"]) or reb_price_map.get(i["stock_code"])
-                        if not price:
-                            continue
-                        sell_orders.append({"stock_code": i["stock_code"], "stock_name": i["stock_name"], "price": price})
-                    if sell_orders:
-                        ok, msg = db.sell_stocks(preset_name, sell_orders)
-                        msgs.append(f"매도 - {msg}")
-
-                if buy_items:
-                    with st.spinner("매수 실시간 가격 조회 중..."):
-                        buy_rt = kis.get_realtime_prices([i["종목코드"] for i in buy_items])
-                    priced_buy = []
-                    for i in buy_items:
-                        price = buy_rt.get(i["종목코드"]) or i["현재가"]
-                        if price and price > 0:
-                            priced_buy.append({"stock_code": i["종목코드"], "stock_name": i["종목명"], "price": price})
-                    if priced_buy:
-                        cash_now = db.get_or_create_portfolio(preset_name)["cash_balance"]
-                        per_stock_amount = cash_now / len(priced_buy)
-                        buy_orders = []
-                        for p in priced_buy:
-                            qty = int(per_stock_amount // p["price"])
-                            if qty > 0:
-                                buy_orders.append({"stock_code": p["stock_code"], "stock_name": p["stock_name"],
-                                                    "quantity": qty, "price": p["price"]})
-                        if buy_orders:
-                            ok, msg = db.buy_stocks(preset_name, buy_orders)
-                            msgs.append(f"매수 - {msg}")
-
-                db.mark_rebalanced(preset_name)
-                _clear_rebalance_state(reb_plan)
-                if not msgs:
-                    st.warning("체크된 거래가 없어 아무 것도 실행하지 않았습니다.")
-                else:
-                    for m in msgs:
-                        st.success(m)
-                st.rerun()
-
 
 # ══════════════════════════════════════════════════════════
 # 프리셋 비교 화면
@@ -1122,6 +997,121 @@ elif page == "프리셋 비교":
                         hv.columns = ["종목코드", "종목명", "수량", "평균매입가", "현재가", "평가금액", "수익률(%)"]
                         hv = format_currency_cols(hv, ["평균매입가", "현재가", "평가금액"])
                         st.dataframe(hv, use_container_width=True, hide_index=True)
+
+                with st.expander("🔄 리밸런싱"):
+                    reb_name = row["name"]
+                    st.caption("이 프리셋에 **저장된 조건** 기준으로, 보유 종목 중 조건을 벗어난 건 팔고 새로 조건에 맞는 건 삽니다. "
+                               "실행 전에 무엇을 팔고 살지 먼저 보여드리고, 체크 해제한 종목은 거래하지 않습니다.")
+
+                    if st.button("🔄 리밸런싱 대상 확인", key=f"reb_check_btn_{reb_name}"):
+                        reb_criteria = row["criteria"]
+                        reb_matched = filter_stocks(df, reb_criteria)
+                        if reb_criteria.get("mode") == "랭킹 모드" and reb_criteria.get("ranking_labels"):
+                            reb_matched, _ = rank_stocks(reb_matched, reb_criteria["ranking_labels"], reb_criteria.get("top_n", 20))
+
+                        reb_passing_codes = set(reb_matched["종목코드"])
+                        reb_holdings_now = db.get_holdings(reb_name)
+                        reb_current_codes = set(reb_holdings_now["stock_code"])
+
+                        reb_to_sell = reb_holdings_now[reb_holdings_now["stock_code"].isin(reb_current_codes - reb_passing_codes)]
+                        reb_to_buy = reb_matched[reb_matched["종목코드"].isin(reb_passing_codes - reb_current_codes)]
+
+                        st.session_state["_rebalance_plan"] = {
+                            "preset_name": reb_name,
+                            "sell": reb_to_sell[["stock_code", "stock_name", "quantity"]].to_dict("records"),
+                            "buy": reb_to_buy[["종목코드", "종목명", "현재가"]].to_dict("records"),
+                        }
+                        st.rerun()
+
+                    reb_plan = st.session_state.get("_rebalance_plan")
+                    if reb_plan and reb_plan["preset_name"] == reb_name:
+                        if not reb_plan["sell"] and not reb_plan["buy"]:
+                            st.success("✅ 이미 조건에 다 맞습니다. 리밸런싱할 대상이 없습니다.")
+                            st.session_state.pop("_rebalance_plan", None)
+                        else:
+                            reb_price_map = df.set_index("종목코드")["현재가"].to_dict()
+
+                            if reb_plan["sell"]:
+                                st.markdown(f"**🔻 매도 예정 ({len(reb_plan['sell'])}개, 조건 이탈)**")
+                                for item in reb_plan["sell"]:
+                                    ref_price = reb_price_map.get(item["stock_code"])
+                                    label = f"{item['stock_name']}({item['stock_code']}) {item['quantity']}주"
+                                    if ref_price:
+                                        label += f" · 약 {ref_price:,.0f}원"
+                                    st.checkbox(label, value=True, key=f"reb_sell_{reb_name}_{item['stock_code']}")
+
+                            if reb_plan["buy"]:
+                                st.markdown(f"**🔺 매수 예정 ({len(reb_plan['buy'])}개, 신규 조건 충족)**")
+                                for item in reb_plan["buy"]:
+                                    label = f"{item['종목명']}({item['종목코드']}) · 약 {item['현재가']:,.0f}원"
+                                    st.checkbox(label, value=True, key=f"reb_buy_{reb_name}_{item['종목코드']}")
+
+                            st.caption("💡 체크 해제한 종목은 거래되지 않습니다. 매수 금액은 확정 시점의 현금을 체크된 매수 종목 수만큼 균등분배합니다.")
+
+                            col_confirm, col_cancel = st.columns(2)
+                            confirm_clicked = col_confirm.button("✅ 리밸런싱 확정", type="primary", key=f"reb_confirm_btn_{reb_name}")
+                            cancel_clicked = col_cancel.button("취소", key=f"reb_cancel_btn_{reb_name}")
+
+                            def _clear_rebalance_state(plan, name):
+                                for item in plan["sell"]:
+                                    st.session_state.pop(f"reb_sell_{name}_{item['stock_code']}", None)
+                                for item in plan["buy"]:
+                                    st.session_state.pop(f"reb_buy_{name}_{item['종목코드']}", None)
+                                st.session_state.pop("_rebalance_plan", None)
+
+                            if cancel_clicked:
+                                _clear_rebalance_state(reb_plan, reb_name)
+                                st.rerun()
+
+                            if confirm_clicked:
+                                sell_items = [i for i in reb_plan["sell"]
+                                              if st.session_state.get(f"reb_sell_{reb_name}_{i['stock_code']}")]
+                                buy_items = [i for i in reb_plan["buy"]
+                                             if st.session_state.get(f"reb_buy_{reb_name}_{i['종목코드']}")]
+
+                                msgs = []
+                                if sell_items:
+                                    with st.spinner("매도 실시간 가격 조회 중..."):
+                                        sell_rt = kis.get_realtime_prices([i["stock_code"] for i in sell_items])
+                                    sell_orders = []
+                                    for i in sell_items:
+                                        price = sell_rt.get(i["stock_code"]) or reb_price_map.get(i["stock_code"])
+                                        if not price:
+                                            continue
+                                        sell_orders.append({"stock_code": i["stock_code"], "stock_name": i["stock_name"], "price": price})
+                                    if sell_orders:
+                                        ok, msg = db.sell_stocks(reb_name, sell_orders)
+                                        msgs.append(f"매도 - {msg}")
+
+                                if buy_items:
+                                    with st.spinner("매수 실시간 가격 조회 중..."):
+                                        buy_rt = kis.get_realtime_prices([i["종목코드"] for i in buy_items])
+                                    priced_buy = []
+                                    for i in buy_items:
+                                        price = buy_rt.get(i["종목코드"]) or i["현재가"]
+                                        if price and price > 0:
+                                            priced_buy.append({"stock_code": i["종목코드"], "stock_name": i["종목명"], "price": price})
+                                    if priced_buy:
+                                        cash_now = db.get_or_create_portfolio(reb_name)["cash_balance"]
+                                        per_stock_amount = cash_now / len(priced_buy)
+                                        buy_orders = []
+                                        for p in priced_buy:
+                                            qty = int(per_stock_amount // p["price"])
+                                            if qty > 0:
+                                                buy_orders.append({"stock_code": p["stock_code"], "stock_name": p["stock_name"],
+                                                                    "quantity": qty, "price": p["price"]})
+                                        if buy_orders:
+                                            ok, msg = db.buy_stocks(reb_name, buy_orders)
+                                            msgs.append(f"매수 - {msg}")
+
+                                db.mark_rebalanced(reb_name)
+                                _clear_rebalance_state(reb_plan, reb_name)
+                                if not msgs:
+                                    st.warning("체크된 거래가 없어 아무 것도 실행하지 않았습니다.")
+                                else:
+                                    for m in msgs:
+                                        st.success(m)
+                                st.rerun()
 
                 with st.expander("📈 벤치마크와 비교하기"):
                     funding_events = db.backfill_initial_funding_event(row["name"])
