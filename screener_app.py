@@ -308,6 +308,45 @@ def format_currency_cols(view_df, cols):
     return view_df
 
 
+def build_preset_report_text(name, criteria, holdings_df, portfolio, total_asset, total_return, transactions_df, earliest_buy_date):
+    """프리셋 하나의 조건/수익률/보유종목/거래내역을 AI 상담용 텍스트로 정리.
+    holdings_df는 '현재가' 컬럼이 이미 채워져 있어야 함 (호출부에서 실시간/스냅샷 가격 반영 후 넘길 것)."""
+    lines = [f"## 프리셋: {name}", "", "### 조건", summarize_criteria(criteria), ""]
+
+    lines.append("### 매매 정보")
+    lines.append(f"- 매매 시작일: {earliest_buy_date or '아직 매수 이력 없음'}")
+    lines.append(f"- 시작 자금: {portfolio['initial_cash']:,.0f}원")
+    lines.append(f"- 현재 평가자산: {total_asset:,.0f}원 (현금 {portfolio['cash_balance']:,.0f}원 포함)")
+    lines.append(f"- 총 수익률: {total_return:+.2f}%")
+    lines.append("")
+
+    lines.append(f"### 보유 종목 ({len(holdings_df)}개)")
+    if len(holdings_df) == 0:
+        lines.append("- 없음")
+    else:
+        for _, row in holdings_df.iterrows():
+            buy_price = row["avg_buy_price"]
+            stock_return = ((row["현재가"] - buy_price) / buy_price * 100) if buy_price else 0
+            lines.append(
+                f"- {row['stock_name']}({row['stock_code']}) {row['quantity']}주 · "
+                f"평균매입가 {buy_price:,.0f}원 · 현재가 {row['현재가']:,.0f}원 · 수익률 {stock_return:+.2f}%"
+            )
+    lines.append("")
+
+    lines.append(f"### 거래 이력 ({len(transactions_df)}건, 최신순)")
+    if len(transactions_df) == 0:
+        lines.append("- 없음")
+    else:
+        for _, row in transactions_df.iterrows():
+            lines.append(
+                f"- {str(row['timestamp'])[:16].replace('T', ' ')} {row['action']} "
+                f"{row['stock_name']}({row['stock_code']}) {row['quantity']}주 @ {row['price']:,.0f}원 "
+                f"(금액 {row['amount']:,.0f}원)"
+            )
+    lines.append("")
+    return "\n".join(lines)
+
+
 def render_data_freshness_notice(result):
     """백테스터가 실제로 갖고 있는 과거 주가 데이터가 최신 시점 기준 며칠 전까지인지 표시.
     많이 오래됐으면(허용범위 21일 초과) 마지막 시점 결과가 부정확할 수 있다고 경고한다
@@ -326,6 +365,38 @@ def render_data_freshness_notice(result):
         )
     else:
         st.caption(f"📅 가격 데이터 최신 기준일: {latest_str}")
+
+
+def build_backtest_report_text(preset_name, criteria, months_option, result, mode_label):
+    """백테스트 결과 하나(또는 종목 수 비교의 N 하나)를 AI 상담용 텍스트로 정리"""
+    lines = [f"## 백테스트: {preset_name} ({mode_label})", "", "### 조건", summarize_criteria(criteria), ""]
+
+    lines.append("### 백테스트 설정 및 결과")
+    lines.append(f"- 기간: {months_option}개월 전부터")
+    lines.append(f"- 시작 자금: {result['initial_amount']:,.0f}원")
+    lines.append(f"- 최종 자산: {result['final_value']:,.0f}원")
+    lines.append(f"- 총 수익률: {result['final_return']:+.2f}%")
+    if result.get("data_staleness_days") is not None and result.get("data_latest_price_date") is not None:
+        latest_str = pd.to_datetime(result["data_latest_price_date"]).strftime("%Y-%m-%d")
+        lines.append(f"- 가격 데이터 최신 기준일: {latest_str} (이보다 최근 구간은 참고용)")
+    lines.append("")
+
+    lines.append("### 벤치마크 대비")
+    for name, series in result["benchmarks"].items():
+        final_bench = series[-1]["총자산"] if series else None
+        if final_bench is None:
+            lines.append(f"- {name}: 데이터 부족으로 비교 불가")
+            continue
+        bench_return = (final_bench - result["initial_amount"]) / result["initial_amount"] * 100
+        alpha = result["final_return"] - bench_return
+        lines.append(f"- {name}: {bench_return:+.2f}% (알파 {alpha:+.2f}%p)")
+    lines.append("")
+
+    last_row = result["portfolio"][-1] if result["portfolio"] else None
+    lines.append("### 최종 시점 보유 종목")
+    lines.append(f"- {last_row['보유종목']}" if last_row and last_row.get("보유종목") else "- 없음")
+    lines.append("")
+    return "\n".join(lines)
 
 
 import os
@@ -862,7 +933,8 @@ elif page == "프리셋 비교":
 
             summary_rows.append({
                 "name": name, "criteria": criteria, "matched": len(matched),
-                "holdings_count": len(holdings), "total_asset": total_asset, "total_return": total_return
+                "holdings_count": len(holdings), "total_asset": total_asset, "total_return": total_return,
+                "holdings": holdings, "portfolio": portfolio,
             })
 
         # 수익률 높은 순으로 정렬해서 카드 표시
@@ -873,7 +945,9 @@ elif page == "프리셋 비교":
 
         for i, row in enumerate(summary_rows):
             with st.container(border=True):
-                col1, col2, col3, col4 = st.columns([2, 1, 1, 1])
+                col0, col1, col2, col3, col4 = st.columns([0.4, 1.8, 1, 1, 1])
+                with col0:
+                    st.checkbox("출력용 선택", key=f"export_select_{row['name']}", label_visibility="collapsed")
                 with col1:
                     rank_emoji = "🥇" if i == 0 else ("🥈" if i == 1 else ("🥉" if i == 2 else "▫️"))
                     st.markdown(f"### {rank_emoji} {row['name']}")
@@ -930,6 +1004,29 @@ elif page == "프리셋 비교":
                                     )
 
         st.caption("💡 '조건 통과 종목 수'는 현재 데이터 기준 실시간 계산, '총 수익률'은 각 프리셋의 모의매매 실적입니다.")
+
+        st.divider()
+        st.subheader("📋 상태 요약 출력")
+        st.caption("위에서 '출력용 선택' 체크박스로 프리셋을 고른 뒤 아래 버튼을 누르면, "
+                   "조건 · 수익률 · 보유종목 · 거래내역을 정리한 텍스트가 나옵니다. "
+                   "그대로 복사해서 AI(클로드, 챗GPT 등)에게 붙여넣어 상담받기 좋은 형식입니다.")
+
+        if st.button("📋 선택한 프리셋 결과 출력"):
+            selected_rows = [r for r in summary_rows if st.session_state.get(f"export_select_{r['name']}")]
+            if not selected_rows:
+                st.warning("먼저 출력할 프리셋을 하나 이상 선택해주세요.")
+            else:
+                report_blocks = []
+                for row in selected_rows:
+                    transactions = db.get_transactions(row["name"])
+                    earliest_buy_date = db.get_earliest_buy_date(row["name"])
+                    report_blocks.append(build_preset_report_text(
+                        row["name"], row["criteria"], row["holdings"], row["portfolio"],
+                        row["total_asset"], row["total_return"], transactions, earliest_buy_date
+                    ))
+                report_text = "\n\n---\n\n".join(report_blocks)
+                st.text_area("아래 내용을 전체 선택(Ctrl+A) 후 복사(Ctrl+C)하세요",
+                             value=report_text, height=400)
 
 
 # ══════════════════════════════════════════════════════════
@@ -1095,6 +1192,15 @@ else:
                 detail_df = format_currency_cols(pd.DataFrame(result["portfolio"]), ["총자산", "현금"])
                 st.dataframe(detail_df, use_container_width=True, hide_index=True)
 
+            if st.button("📋 이 백테스트 결과 출력", key="bt_export_single"):
+                bt_preset_name = st.session_state.get("_backtest_preset_name")
+                bt_criteria = db.load_preset_criteria(bt_preset_name)
+                report_text = build_backtest_report_text(
+                    bt_preset_name, bt_criteria, result["months_back"], result, "단일 실행"
+                )
+                st.text_area("아래 내용을 전체 선택(Ctrl+A) 후 복사(Ctrl+C)하세요",
+                             value=report_text, height=300, key="bt_export_single_text")
+
         n_comparison = st.session_state.get("_backtest_n_comparison")
         if n_comparison:
             st.divider()
@@ -1114,6 +1220,19 @@ else:
             st.dataframe(pd.DataFrame(summary_rows), use_container_width=True, hide_index=True)
 
             render_data_freshness_notice(list(n_comparison.values())[0])
+
+            if st.button("📋 종목 수별 비교 결과 출력", key="bt_export_comparison"):
+                bt_preset_name = st.session_state.get("_backtest_preset_name")
+                bt_criteria = db.load_preset_criteria(bt_preset_name)
+                report_blocks = [
+                    build_backtest_report_text(
+                        bt_preset_name, bt_criteria, res["months_back"], res, f"종목 수 비교 - 상위 {n}개"
+                    )
+                    for n, res in sorted(n_comparison.items())
+                ]
+                report_text = "\n\n---\n\n".join(report_blocks)
+                st.text_area("아래 내용을 전체 선택(Ctrl+A) 후 복사(Ctrl+C)하세요",
+                             value=report_text, height=400, key="bt_export_comparison_text")
 
             st.caption("그래프에 표시할 종목 수 선택")
             n_toggle_cols = st.columns(len(series_map))

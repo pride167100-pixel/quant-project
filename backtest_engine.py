@@ -373,4 +373,5 @@ def run_backtest(criteria, months_back, initial_amount=10_000_000, progress_call
         "final_value": final_value,
         "data_latest_price_date": data_latest_price_date,
         "data_staleness_days": data_staleness_days,
+        "months_back": months_back,
     }
