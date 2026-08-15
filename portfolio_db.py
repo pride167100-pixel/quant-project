@@ -179,6 +179,27 @@ def delete_preset(preset_name):
     conn.close()
 
 
+def rename_preset(old_name, new_name):
+    """프리셋 이름을 바꾼다. preset_name이 여러 테이블의 기본키/외래키처럼 쓰이고 있어서,
+    조건·포트폴리오·보유종목·거래내역·벤치마크 기록 전부 한 번에 같이 바꿔줘야 한다."""
+    new_name = new_name.strip()
+    if not new_name:
+        return False, "새 이름을 입력해주세요."
+    if new_name == old_name:
+        return False, "기존 이름과 같습니다."
+    if new_name in list_presets():
+        return False, f"'{new_name}' 이름은 이미 사용 중입니다."
+
+    conn = get_connection()
+    cur = conn.cursor()
+    for table in ["preset_criteria", "portfolios", "holdings", "transactions",
+                  "funding_events", "benchmark_events"]:
+        cur.execute(f"UPDATE {table} SET preset_name = ? WHERE preset_name = ?", (new_name, old_name))
+    conn.commit()
+    conn.close()
+    return True, f"'{old_name}' → '{new_name}'(으)로 이름을 변경했습니다."
+
+
 def duplicate_preset_criteria(source_name, new_name, initial_cash=10_000_000):
     """조건만 복사해서 새 프리셋 생성 (보유종목/거래내역/벤치마크는 복사하지 않음, 시드머니는 초기화)"""
     import json

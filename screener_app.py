@@ -308,6 +308,40 @@ def format_currency_cols(view_df, cols):
     return view_df
 
 
+def allocate_buy_quantities(amount, price_map, fee_rate=0.0):
+    """총 금액(amount)을 price_map(종목코드->가격)의 종목들에 최대한 균등하게 배분해서 살 수량을 정한다.
+    1차로 종목 수만큼 똑같이 나눠서 사고, 그러고 남는 돈은(원래는 그냥 버려졌음) 아직 살 수 있는
+    종목이 있는 한 한 주씩 돌아가면서(라운드로빈) 계속 추가로 사서 잔금을 최대한 줄인다.
+    반환: ({종목코드: 수량}, 남은 현금)"""
+    codes = list(price_map.keys())
+    qty = {code: 0 for code in codes}
+    if not codes:
+        return qty, amount
+
+    per_stock = amount / len(codes)
+    remaining = amount
+    for code in codes:
+        effective_price = price_map[code] * (1 + fee_rate)
+        if effective_price <= 0:
+            continue
+        q = int(per_stock // effective_price)
+        qty[code] = q
+        remaining -= q * effective_price
+
+    sorted_codes = sorted(codes, key=lambda c: price_map[c])
+    bought_more = True
+    while bought_more:
+        bought_more = False
+        for code in sorted_codes:
+            effective_price = price_map[code] * (1 + fee_rate)
+            if effective_price > 0 and remaining >= effective_price:
+                qty[code] += 1
+                remaining -= effective_price
+                bought_more = True
+
+    return qty, remaining
+
+
 def build_preset_report_text(name, criteria, holdings_df, portfolio, total_asset, total_return, transactions_df, earliest_buy_date):
     """프리셋 하나의 조건/수익률/보유종목/거래내역을 AI 상담용 텍스트로 정리.
     holdings_df는 '현재가' 컬럼이 이미 채워져 있어야 함 (호출부에서 실시간/스냅샷 가격 반영 후 넘길 것)."""
@@ -533,6 +567,18 @@ if page == "스크리너 & 모의매매":
         with col_del:
             if st.button("🗑️ 삭제", use_container_width=True):
                 st.session_state["_confirm_delete"] = preset_name
+
+        with st.sidebar.expander("✏️ 이름 수정"):
+            new_name_input = st.text_input("새 이름", value=preset_name, key=f"rename_input_{preset_name}")
+            if st.button("변경 적용", key=f"rename_apply_{preset_name}"):
+                ok, msg = db.rename_preset(preset_name, new_name_input)
+                if ok:
+                    st.session_state.pop("_loaded_preset", None)
+                    st.session_state["_preset_selector_version"] = st.session_state.get("_preset_selector_version", 0) + 1
+                    st.sidebar.success(msg)
+                    st.rerun()
+                else:
+                    st.sidebar.error(msg)
 
         if st.session_state.get("_confirm_delete") == preset_name:
             st.sidebar.warning(f"'{preset_name}'을(를) 정말 삭제할까요? 보유종목·거래내역·벤치마크 기록이 모두 사라지며 되돌릴 수 없습니다.")
@@ -806,21 +852,27 @@ if page == "스크리너 & 모의매매":
             if price_warnings:
                 st.warning(f"다음 종목은 실시간 조회 실패로 저장된 가격을 사용합니다: {', '.join(price_warnings)}")
 
+            name_map_buy = dict(zip(priced_rows["종목코드"], priced_rows["종목명"]))
+
             if weighting == "균등배분":
-                per_stock_amount = invest_amount / len(priced_rows)
-                weights = {row["종목코드"]: per_stock_amount for _, row in priced_rows.iterrows()}
+                # 똑같이 나눠서 산 다음, 남는 돈으로 더 살 수 있는 종목이 있으면 계속 사서 잔금을 최소화
+                price_map_buy = dict(zip(priced_rows["종목코드"], priced_rows["현재가"]))
+                qty_map, _leftover = allocate_buy_quantities(invest_amount, price_map_buy, fee_rate=db.BUY_FEE_RATE)
+                orders = [
+                    {"stock_code": code, "stock_name": name_map_buy[code], "quantity": qty, "price": price_map_buy[code]}
+                    for code, qty in qty_map.items() if qty > 0
+                ]
             else:
                 total_cap = priced_rows["시가총액"].sum()
                 weights = {row["종목코드"]: invest_amount * (row["시가총액"] / total_cap) for _, row in priced_rows.iterrows()}
-
-            orders = []
-            for _, row in priced_rows.iterrows():
-                amount = weights[row["종목코드"]]
-                price = row["현재가"]
-                qty = int(amount // price) if price > 0 else 0
-                if qty > 0:
-                    orders.append({"stock_code": row["종목코드"], "stock_name": row["종목명"],
-                                    "quantity": qty, "price": price})
+                orders = []
+                for _, row in priced_rows.iterrows():
+                    amount = weights[row["종목코드"]]
+                    price = row["현재가"]
+                    qty = int(amount // price) if price > 0 else 0
+                    if qty > 0:
+                        orders.append({"stock_code": row["종목코드"], "stock_name": row["종목명"],
+                                        "quantity": qty, "price": price})
 
             if orders:
                 success, msg = db.buy_stocks(preset_name, orders)
@@ -912,6 +964,9 @@ elif page == "프리셋 비교":
     if not saved_presets:
         st.info("아직 저장된 프리셋이 없습니다. '스크리너 & 모의매매' 화면에서 조건을 설정하고 저장해주세요.")
     else:
+        st.info(f"📅 조건 통과 종목 수·PBR·PER 등은 **{get_data_timestamp()}** 기준 스냅샷 데이터로 계산됩니다. "
+                f"최신 상태로 보려면 사이드바의 '데이터 새로고침'을 먼저 실행해주세요.")
+
         if st.button("🔄 전체 프리셋 시세 새로고침"):
             all_codes = set()
             for name in saved_presets:
@@ -921,16 +976,18 @@ elif page == "프리셋 비교":
             if all_codes:
                 with st.spinner(f"{len(all_codes)}개 종목 실시간 가격 조회 중..."):
                     st.session_state["_compare_rt_prices"] = kis.get_realtime_prices(list(all_codes))
+                st.session_state["_compare_rt_prices_time"] = datetime.now().strftime("%Y-%m-%d %H:%M")
                 st.success("새로고침 완료!")
             else:
                 st.info("보유 중인 종목이 있는 프리셋이 없습니다.")
             st.rerun()
 
         compare_rt_prices = st.session_state.get("_compare_rt_prices", {})
+        compare_rt_time = st.session_state.get("_compare_rt_prices_time")
         if compare_rt_prices:
-            st.caption("✅ 실시간 가격이 반영된 상태입니다.")
+            st.caption(f"✅ 보유 종목 평가금액에 실시간 가격 반영됨 (조회 시각: {compare_rt_time})")
         else:
-            st.caption("⚠️ 스냅샷 가격 기준입니다. 위 버튼으로 새로고침할 수 있습니다.")
+            st.caption("⚠️ 보유 종목 평가금액은 아직 스냅샷 가격 기준입니다. 위 버튼으로 실시간 새로고침할 수 있습니다.")
 
         summary_rows = []
         for name in saved_presets:
@@ -974,6 +1031,12 @@ elif page == "프리셋 비교":
                 col2.metric("조건 통과", f"{row['matched']}개")
                 col3.metric("보유 종목", f"{row['holdings_count']}개")
                 col4.metric("총 수익률", f"{row['total_return']:+.2f}%")
+
+                first_buy_date = db.get_earliest_buy_date(row["name"])
+                if first_buy_date:
+                    st.caption(f"🏁 첫 매매 시작일: {first_buy_date}")
+                else:
+                    st.caption("🏁 아직 매수 이력이 없습니다.")
 
                 last_reb = row["portfolio"].get("last_rebalanced_at")
                 if last_reb:
@@ -1093,13 +1156,14 @@ elif page == "프리셋 비교":
                                             priced_buy.append({"stock_code": i["종목코드"], "stock_name": i["종목명"], "price": price})
                                     if priced_buy:
                                         cash_now = db.get_or_create_portfolio(reb_name)["cash_balance"]
-                                        per_stock_amount = cash_now / len(priced_buy)
-                                        buy_orders = []
-                                        for p in priced_buy:
-                                            qty = int(per_stock_amount // p["price"])
-                                            if qty > 0:
-                                                buy_orders.append({"stock_code": p["stock_code"], "stock_name": p["stock_name"],
-                                                                    "quantity": qty, "price": p["price"]})
+                                        price_map_reb = {p["stock_code"]: p["price"] for p in priced_buy}
+                                        name_map_reb = {p["stock_code"]: p["stock_name"] for p in priced_buy}
+                                        qty_map, _leftover = allocate_buy_quantities(cash_now, price_map_reb, fee_rate=db.BUY_FEE_RATE)
+                                        buy_orders = [
+                                            {"stock_code": code, "stock_name": name_map_reb[code],
+                                             "quantity": qty, "price": price_map_reb[code]}
+                                            for code, qty in qty_map.items() if qty > 0
+                                        ]
                                         if buy_orders:
                                             ok, msg = db.buy_stocks(reb_name, buy_orders)
                                             msgs.append(f"매수 - {msg}")
