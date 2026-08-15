@@ -69,6 +69,12 @@ def init_db():
         except sqlite3.OperationalError:
             pass  # 이미 컬럼이 존재하는 경우
 
+    # 리밸런싱 확정 시점 기록용 컬럼 (기존 DB에도 안전하게 추가)
+    try:
+        cur.execute("ALTER TABLE portfolios ADD COLUMN last_rebalanced_at TEXT")
+    except sqlite3.OperationalError:
+        pass  # 이미 컬럼이 존재하는 경우
+
     cur.execute("""
         CREATE TABLE IF NOT EXISTS funding_events (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -249,7 +255,8 @@ def get_or_create_portfolio(preset_name, initial_cash=10_000_000):
             (preset_name, initial_cash, initial_cash, datetime.now().isoformat())
         )
         conn.commit()
-        result = {"preset_name": preset_name, "initial_cash": initial_cash, "cash_balance": initial_cash}
+        result = {"preset_name": preset_name, "initial_cash": initial_cash, "cash_balance": initial_cash,
+                   "last_rebalanced_at": None}
     else:
         result = dict(row)
 
@@ -383,6 +390,18 @@ def sell_stocks(preset_name, sell_orders):
     conn.close()
     return True, (f"매도 완료: 실수령액 {total_net_proceeds:,.0f}원 "
                   f"(수수료 {total_fee:,.0f}원 + 거래세 {total_tax:,.0f}원 차감)")
+
+
+def mark_rebalanced(preset_name):
+    """리밸런싱을 확정 실행한 시각을 기록 (화면에 '마지막 리밸런싱 N일 경과' 표시용)"""
+    conn = get_connection()
+    cur = conn.cursor()
+    cur.execute(
+        "UPDATE portfolios SET last_rebalanced_at = ? WHERE preset_name = ?",
+        (datetime.now().isoformat(), preset_name)
+    )
+    conn.commit()
+    conn.close()
 
 
 def backfill_initial_funding_event(preset_name):
