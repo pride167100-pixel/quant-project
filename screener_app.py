@@ -269,6 +269,10 @@ def gather_current_criteria():
     result["mode"] = "랭킹 모드" if st.session_state.get("scr_use_ranking", False) else "필터 모드"
     result["ranking_labels"] = st.session_state.get("scr_ranking_labels", [])
     result["top_n"] = st.session_state.get("scr_top_n", 20)
+    result["use_balance"] = st.session_state.get("scr_use_balance", False)
+    result["balance_pct"] = st.session_state.get("scr_balance_pct", 50)
+    result["use_sector_cap"] = st.session_state.get("scr_use_sector_cap", False)
+    result["sector_cap"] = st.session_state.get("scr_sector_cap", 5)
     return result
 
 
@@ -288,6 +292,14 @@ def apply_criteria_to_state(criteria):
         st.session_state["scr_ranking_labels"] = criteria["ranking_labels"]
     if "top_n" in criteria:
         st.session_state["scr_top_n"] = criteria["top_n"]
+    if "use_balance" in criteria:
+        st.session_state["scr_use_balance"] = criteria["use_balance"]
+    if "balance_pct" in criteria and criteria["balance_pct"] is not None:
+        st.session_state["scr_balance_pct"] = criteria["balance_pct"]
+    if "use_sector_cap" in criteria:
+        st.session_state["scr_use_sector_cap"] = criteria["use_sector_cap"]
+    if "sector_cap" in criteria and criteria["sector_cap"] is not None:
+        st.session_state["scr_sector_cap"] = criteria["sector_cap"]
 
 
 def normalize_date_index(df, date_col="날짜", value_col="총자산", new_name=None):
@@ -499,6 +511,10 @@ def reset_criteria_to_defaults():
     st.session_state["scr_use_ranking"] = False
     st.session_state["scr_ranking_labels"] = []
     st.session_state["scr_top_n"] = 20
+    st.session_state["scr_use_balance"] = False
+    st.session_state["scr_balance_pct"] = 50
+    st.session_state["scr_use_sector_cap"] = False
+    st.session_state["scr_sector_cap"] = 5
     st.session_state.pop("select_all_results", None)
     st.session_state.pop("result_editor", None)
     st.session_state.pop("select_all_holdings", None)
@@ -769,7 +785,37 @@ if page == "스크리너 & 모의매매":
 
         st.caption(f"필터 통과 종목({len(hard_filtered)}개) 중, 선택한 지표가 전부 존재하는 종목만 랭킹에 포함됩니다.")
 
-        filtered, rank_cols_for_display = rank_stocks(hard_filtered, selected_labels, top_n)
+        col_bal, col_sec = st.columns(2)
+        with col_bal:
+            use_balance = st.checkbox(
+                "균형도 필터 사용", key="scr_use_balance",
+                help="선택한 지표 '전부'에서 상위 N% 안에 드는 종목만 남깁니다(교집합). "
+                     "한 지표에만 몰빵되어 강하고 다른 지표는 나쁜 종목을 걸러내고, 여러 지표에서 고르게 준수한 종목만 남깁니다."
+            )
+            balance_pct = None
+            if use_balance:
+                balance_pct = st.number_input(
+                    "상위 몇 %까지 (지표별, 직접입력)", min_value=1, max_value=100, value=50, step=1,
+                    key="scr_balance_pct"
+                )
+        with col_sec:
+            use_sector_cap = st.checkbox(
+                "업종 분산(계란 나눠 담기) 사용", key="scr_use_sector_cap",
+                help="합산순위 순서대로 담되, 같은 업종이 설정한 개수만큼 이미 담겼으면 건너뛰고 다음 순위로 넘어갑니다."
+            )
+            sector_cap = None
+            if use_sector_cap:
+                sector_cap = st.number_input(
+                    "업종당 최대 몇 종목까지 (직접입력)", min_value=1, max_value=200, value=5, step=1,
+                    key="scr_sector_cap"
+                )
+
+        filtered, rank_cols_for_display = rank_stocks(
+            hard_filtered, selected_labels, top_n, balance_pct=balance_pct, sector_cap=sector_cap
+        )
+        if use_balance or use_sector_cap:
+            st.caption(f"👉 균형도/업종 분산 필터 적용 후 최종 {len(filtered)}개가 남았습니다 "
+                       f"(요청한 {top_n}개보다 적을 수 있습니다 - 억지로 채우지 않습니다).")
 
         st.subheader(f"📊 {preset_name} (정렬 상위 {len(filtered)}개)")
         col1, col2, col3 = st.columns(3)
@@ -1071,7 +1117,11 @@ elif page == "프리셋 비교":
                         reb_criteria = row["criteria"]
                         reb_matched = filter_stocks(df, reb_criteria)
                         if reb_criteria.get("mode") == "랭킹 모드" and reb_criteria.get("ranking_labels"):
-                            reb_matched, _ = rank_stocks(reb_matched, reb_criteria["ranking_labels"], reb_criteria.get("top_n", 20))
+                            reb_matched, _ = rank_stocks(
+                                reb_matched, reb_criteria["ranking_labels"], reb_criteria.get("top_n", 20),
+                                balance_pct=reb_criteria.get("balance_pct") if reb_criteria.get("use_balance") else None,
+                                sector_cap=reb_criteria.get("sector_cap") if reb_criteria.get("use_sector_cap") else None,
+                            )
 
                         reb_passing_codes = set(reb_matched["종목코드"])
                         reb_holdings_now = db.get_holdings(reb_name)
@@ -1331,7 +1381,9 @@ else:
                         comparison_results[n] = bt.run_backtest(
                             criteria, months_back=months_option,
                             initial_amount=bt_initial_amount, progress_callback=_update_progress,
-                            use_ranking=True, ranking_indicators=bt_ranking_indicators, top_n=n
+                            use_ranking=True, ranking_indicators=bt_ranking_indicators, top_n=n,
+                            balance_pct=criteria.get("balance_pct") if criteria.get("use_balance") else None,
+                            sector_cap=criteria.get("sector_cap") if criteria.get("use_sector_cap") else None,
                         )
                     except FileNotFoundError as e:
                         st.error(f"필요한 데이터 파일을 찾을 수 없습니다: {e}")
@@ -1352,7 +1404,9 @@ else:
                     result = bt.run_backtest(
                         criteria, months_back=months_option,
                         initial_amount=bt_initial_amount, progress_callback=_update_progress,
-                        use_ranking=bt_use_ranking, ranking_indicators=bt_ranking_indicators, top_n=bt_top_n
+                        use_ranking=bt_use_ranking, ranking_indicators=bt_ranking_indicators, top_n=bt_top_n,
+                        balance_pct=criteria.get("balance_pct") if criteria.get("use_balance") else None,
+                        sector_cap=criteria.get("sector_cap") if criteria.get("use_sector_cap") else None,
                     )
                     progress_bar.empty()
                     st.session_state["_backtest_result"] = result
@@ -1548,6 +1602,8 @@ else:
                             pcriteria, months_back=compare_months,
                             initial_amount=compare_initial, progress_callback=_update_multi_progress,
                             use_ranking=p_use_ranking, ranking_indicators=p_ranking_indicators, top_n=p_top_n,
+                            balance_pct=pcriteria.get("balance_pct") if pcriteria.get("use_balance") else None,
+                            sector_cap=pcriteria.get("sector_cap") if pcriteria.get("use_sector_cap") else None,
                         )
                     except FileNotFoundError as e:
                         st.error(f"필요한 데이터 파일을 찾을 수 없습니다: {e}")

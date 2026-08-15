@@ -259,12 +259,13 @@ def get_monthly_rebalance_dates(months_back):
 
 
 def run_backtest(criteria, months_back, initial_amount=10_000_000, progress_callback=None,
-                  use_ranking=False, ranking_indicators=None, top_n=20):
+                  use_ranking=False, ranking_indicators=None, top_n=20, balance_pct=None, sector_cap=None):
     """
     criteria: screener_logic 형식의 조건 딕셔너리 (1차 필터로 항상 적용됨)
     months_back: 몇 개월 전부터 시작할지 (3, 6, 12, 24, 36 등)
     use_ranking: True면, 1차 필터 통과 종목 중 랭킹 상위 top_n개만 매달 재선정
     ranking_indicators: rank_stocks에 넘길 지표 라벨 리스트 (screener_logic.RANKING_INDICATORS 참고)
+    balance_pct/sector_cap: rank_stocks에 그대로 전달 (균형도 필터/업종 분산 - screener_logic.rank_stocks 참고)
     반환: {"portfolio": [...], "benchmarks": {...}, "final_return": float}
     """
     static_info, financials, prices, timeline = load_backtest_data()
@@ -287,7 +288,7 @@ def run_backtest(criteria, months_back, initial_amount=10_000_000, progress_call
         passing = filter_stocks(snapshot, criteria)
 
         if use_ranking and ranking_indicators:
-            passing, _ = rank_stocks(passing, ranking_indicators, top_n)
+            passing, _ = rank_stocks(passing, ranking_indicators, top_n, balance_pct=balance_pct, sector_cap=sector_cap)
 
         passing_codes = set(passing["종목코드"]) if len(passing) > 0 else set()
         current_codes = set(holdings.keys())

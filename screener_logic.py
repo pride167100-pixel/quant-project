@@ -3,6 +3,7 @@
 screener_app.py(실시간 화면)와 backtest_engine.py(백테스터)가 공통으로 재사용한다.
 동일한 로직을 두 곳에서 따로 구현하면 결과가 미묘하게 달라질 위험이 있어, 반드시 이 파일을 통해서만 필터링한다.
 """
+import pandas as pd
 
 # 저장/불러오기 대상이 되는 모든 조건 키 목록
 # (use_key, key, label, 기본사용여부, min, max, 기본값, step, 부등호기호)
@@ -107,8 +108,16 @@ def summarize_criteria_lines(criteria):
     return lines if lines else ["(설정된 조건 없음)"]
 
 
-def rank_stocks(df, selected_labels, top_n):
-    """선택된 지표들로 순위를 매겨 합산순위 기준 상위 N개 반환"""
+def rank_stocks(df, selected_labels, top_n, balance_pct=None, sector_cap=None):
+    """선택된 지표들로 순위를 매겨 합산순위 기준 상위 N개 반환.
+
+    balance_pct: 지정하면(0~100 사이 숫자), 선택한 지표 '전부' 에서 상위 balance_pct% 안에
+        드는 종목만 남긴다(교집합). 한 지표에만 몰빵되어 강한 종목(다른 지표는 나쁨)을
+        걸러내고, 여러 지표에서 고르게 준수한 종목만 남기기 위한 필터.
+    sector_cap: 지정하면, 합산순위 순서대로 담되 같은 업종명이 이미 이 개수만큼 담겼으면
+        건너뛰고 다음 순위로 넘어간다("계란을 한 바구니에 담지 않기" - 업종 쏠림 방지).
+        둘 다 지정 안 하면 기존과 동일하게 동작한다.
+    """
     label_map = {label: (col, better) for label, col, better in RANKING_INDICATORS}
     selected = [label_map[label] for label in selected_labels]
 
@@ -125,6 +134,31 @@ def rank_stocks(df, selected_labels, top_n):
         rank_cols.append(rank_col)
 
     ranked["합산순위"] = ranked[rank_cols].sum(axis=1)
-    ranked = ranked.sort_values("합산순위").head(top_n).reset_index(drop=True)
+
+    if balance_pct is not None and len(ranked) > 0:
+        cutoff_rank = max(1, len(ranked) * balance_pct / 100)
+        balance_mask = pd.Series(True, index=ranked.index)
+        for rank_col in rank_cols:
+            balance_mask &= ranked[rank_col] <= cutoff_rank
+        ranked = ranked[balance_mask]
+
+    ranked = ranked.sort_values("합산순위")
+
+    if sector_cap is not None and "업종명" in ranked.columns:
+        picked_idx = []
+        sector_counts = {}
+        for idx, row in ranked.iterrows():
+            if len(picked_idx) >= top_n:
+                break
+            sector = row["업종명"]
+            if sector_counts.get(sector, 0) >= sector_cap:
+                continue
+            picked_idx.append(idx)
+            sector_counts[sector] = sector_counts.get(sector, 0) + 1
+        ranked = ranked.loc[picked_idx]
+    else:
+        ranked = ranked.head(top_n)
+
+    ranked = ranked.reset_index(drop=True)
     ranked.insert(0, "최종순위", range(1, len(ranked) + 1))
     return ranked, rank_cols
