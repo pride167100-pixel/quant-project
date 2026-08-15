@@ -308,36 +308,47 @@ def format_currency_cols(view_df, cols):
     return view_df
 
 
-def allocate_buy_quantities(amount, price_map, fee_rate=0.0):
-    """총 금액(amount)을 price_map(종목코드->가격)의 종목들에 최대한 균등하게 배분해서 살 수량을 정한다.
-    1차로 종목 수만큼 똑같이 나눠서 사고, 그러고 남는 돈은(원래는 그냥 버려졌음) 아직 살 수 있는
-    종목이 있는 한 한 주씩 돌아가면서(라운드로빈) 계속 추가로 사서 잔금을 최대한 줄인다.
+def allocate_buy_quantities(amount, price_map, weight_map=None, fee_rate=0.0):
+    """총 금액(amount)을 price_map(종목코드->가격)의 종목들에 배분해서 살 수량을 정한다.
+    weight_map을 안 주면 균등배분(전부 동일 비중), 주면 그 비중대로 배분(예: 시가총액가중).
+    1차로 목표 배분액만큼 정수로 나눠 사고, 남는 돈은(원래는 그냥 버려졌음) 그때그때
+    '목표 배분액 대비 가장 덜 채워진' 종목부터 한 주씩 계속 추가로 사서 잔금을 최대한 줄인다
+    (균등배분이면 결과적으로 골고루, 시가총액가중이면 비중을 크게 안 흩트리면서 채워짐).
     반환: ({종목코드: 수량}, 남은 현금)"""
     codes = list(price_map.keys())
     qty = {code: 0 for code in codes}
     if not codes:
         return qty, amount
 
-    per_stock = amount / len(codes)
+    if weight_map is None:
+        weight_map = {code: 1 for code in codes}
+    total_weight = sum(weight_map.get(code, 0) for code in codes) or 1
+    target = {code: amount * (weight_map.get(code, 0) / total_weight) for code in codes}
+
     remaining = amount
+    spent = {code: 0.0 for code in codes}
     for code in codes:
         effective_price = price_map[code] * (1 + fee_rate)
         if effective_price <= 0:
             continue
-        q = int(per_stock // effective_price)
+        q = int(target[code] // effective_price)
         qty[code] = q
-        remaining -= q * effective_price
+        spent[code] = q * effective_price
+        remaining -= spent[code]
 
-    sorted_codes = sorted(codes, key=lambda c: price_map[c])
-    bought_more = True
-    while bought_more:
-        bought_more = False
-        for code in sorted_codes:
-            effective_price = price_map[code] * (1 + fee_rate)
-            if effective_price > 0 and remaining >= effective_price:
-                qty[code] += 1
-                remaining -= effective_price
-                bought_more = True
+    # 목표 배분액 대비 가장 부족한(underfilled) 종목부터 한 주씩 계속 추가 매수
+    progressed = True
+    while progressed:
+        progressed = False
+        affordable = [c for c in codes if 0 < price_map[c] * (1 + fee_rate) <= remaining]
+        if not affordable:
+            break
+        pick = max(affordable, key=lambda c: target[c] - spent[c])
+        effective_price = price_map[pick] * (1 + fee_rate)
+        qty[pick] += 1
+        spent[pick] += effective_price
+        remaining -= effective_price
+        progressed = True
 
     return qty, remaining
 
@@ -854,25 +865,15 @@ if page == "스크리너 & 모의매매":
 
             name_map_buy = dict(zip(priced_rows["종목코드"], priced_rows["종목명"]))
 
-            if weighting == "균등배분":
-                # 똑같이 나눠서 산 다음, 남는 돈으로 더 살 수 있는 종목이 있으면 계속 사서 잔금을 최소화
-                price_map_buy = dict(zip(priced_rows["종목코드"], priced_rows["현재가"]))
-                qty_map, _leftover = allocate_buy_quantities(invest_amount, price_map_buy, fee_rate=db.BUY_FEE_RATE)
-                orders = [
-                    {"stock_code": code, "stock_name": name_map_buy[code], "quantity": qty, "price": price_map_buy[code]}
-                    for code, qty in qty_map.items() if qty > 0
-                ]
-            else:
-                total_cap = priced_rows["시가총액"].sum()
-                weights = {row["종목코드"]: invest_amount * (row["시가총액"] / total_cap) for _, row in priced_rows.iterrows()}
-                orders = []
-                for _, row in priced_rows.iterrows():
-                    amount = weights[row["종목코드"]]
-                    price = row["현재가"]
-                    qty = int(amount // price) if price > 0 else 0
-                    if qty > 0:
-                        orders.append({"stock_code": row["종목코드"], "stock_name": row["종목명"],
-                                        "quantity": qty, "price": price})
+            price_map_buy = dict(zip(priced_rows["종목코드"], priced_rows["현재가"]))
+            # 균등배분이면 비중 없이(전부 동일), 시가총액가중이면 시가총액 비례 비중으로 배분.
+            # 어느 쪽이든 1차 배분 후 남는 돈은 목표 배분액 대비 가장 부족한 종목부터 채워서 잔금을 최소화.
+            weight_map_buy = None if weighting == "균등배분" else dict(zip(priced_rows["종목코드"], priced_rows["시가총액"]))
+            qty_map, _leftover = allocate_buy_quantities(invest_amount, price_map_buy, weight_map_buy, fee_rate=db.BUY_FEE_RATE)
+            orders = [
+                {"stock_code": code, "stock_name": name_map_buy[code], "quantity": qty, "price": price_map_buy[code]}
+                for code, qty in qty_map.items() if qty > 0
+            ]
 
             if orders:
                 success, msg = db.buy_stocks(preset_name, orders)
