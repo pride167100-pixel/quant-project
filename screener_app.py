@@ -1260,8 +1260,7 @@ else:
         "⚠️ 이 백테스트는 다음과 같은 한계가 있습니다:\n"
         "- **생존편향**: 현재 상장된 종목만 대상이라, 그 사이 상장폐지된 종목은 반영되지 않아 실제보다 유리하게 나올 수 있습니다.\n"
         "- **발행주식수**: 과거 시점이 아닌 현재 발행주식수를 사용해 시가총액/PBR/PER을 근사 계산합니다.\n"
-        "- **재무데이터 공시시차**: 4월 1일을 기준으로 전년도/재작년도 실적 중 '그 시점에 이미 공시됐을' 데이터를 근사적으로 사용합니다.\n"
-        "- **필터 모드 조건만 지원**: 랭킹 모드로 저장된 조건은 아직 지원하지 않습니다."
+        "- **재무데이터 공시시차**: 4월 1일을 기준으로 전년도/재작년도 실적 중 '그 시점에 이미 공시됐을' 데이터를 근사적으로 사용합니다."
     )
 
     if not saved_presets:
@@ -1508,3 +1507,108 @@ else:
                 with st.expander(f"📦 {n}개 종목 기준 - 월별 보유 내역"):
                     detail_df = format_currency_cols(pd.DataFrame(res["portfolio"]), ["총자산", "현금"])
                     st.dataframe(detail_df, use_container_width=True, hide_index=True)
+
+        st.divider()
+        st.subheader("🆚 여러 프리셋 동시 비교")
+        st.caption("위 설정과 무관하게, 각 프리셋에 **저장된 조건**(필터/랭킹 설정 그대로) 그대로 여러 프리셋을 한 번에 "
+                   "백테스트해서 비교합니다.")
+
+        compare_presets = st.multiselect("비교할 프리셋 선택 (2개 이상)", saved_presets, key="bt_multi_preset_select")
+        col_m1, col_m2 = st.columns(2)
+        with col_m1:
+            compare_months = st.selectbox(
+                "시작 시점", [3, 6, 12, 24, 36], index=2,
+                format_func=lambda m: f"{m}개월 전부터", key="bt_multi_months_back"
+            )
+        with col_m2:
+            compare_initial = st.number_input(
+                "시작 자금 (원)", min_value=100_000, value=10_000_000, step=1_000_000, key="bt_multi_initial_amount"
+            )
+
+        if st.button("▶️ 여러 프리셋 백테스트 실행", key="bt_multi_run"):
+            if len(compare_presets) < 2:
+                st.warning("2개 이상의 프리셋을 선택해주세요.")
+            else:
+                multi_progress = st.progress(0.0, text="여러 프리셋 비교 계산 중...")
+                preset_results = {}
+                for i, pname in enumerate(compare_presets):
+                    pcriteria = db.load_preset_criteria(pname)
+                    if pcriteria is None:
+                        continue
+                    p_use_ranking = pcriteria.get("mode") == "랭킹 모드"
+                    p_ranking_indicators = pcriteria.get("ranking_labels") if p_use_ranking else None
+                    p_top_n = pcriteria.get("top_n", 20)
+
+                    def _update_multi_progress(step, total, i=i, pname=pname):
+                        overall = (i + step / total) / len(compare_presets)
+                        multi_progress.progress(overall, text=f"{pname} 계산 중... ({i+1}/{len(compare_presets)})")
+
+                    try:
+                        preset_results[pname] = bt.run_backtest(
+                            pcriteria, months_back=compare_months,
+                            initial_amount=compare_initial, progress_callback=_update_multi_progress,
+                            use_ranking=p_use_ranking, ranking_indicators=p_ranking_indicators, top_n=p_top_n,
+                        )
+                    except FileNotFoundError as e:
+                        st.error(f"필요한 데이터 파일을 찾을 수 없습니다: {e}")
+                        preset_results = None
+                        break
+
+                multi_progress.empty()
+                st.session_state["_backtest_preset_comparison"] = preset_results
+
+        preset_comparison = st.session_state.get("_backtest_preset_comparison")
+        if preset_comparison:
+            st.markdown("#### 비교 결과")
+            multi_summary_rows = []
+            multi_series_map = {}
+            for pname, res in preset_comparison.items():
+                multi_summary_rows.append({
+                    "프리셋": pname, "최종 자산": f"{res['final_value']:,.0f}",
+                    "총 수익률(%)": round(res["final_return"], 2)
+                })
+                multi_series_map[pname] = normalize_date_index(pd.DataFrame(res["portfolio"]), value_col="총자산", new_name=pname)
+            multi_summary_rows.sort(key=lambda r: r["총 수익률(%)"], reverse=True)
+            st.dataframe(pd.DataFrame(multi_summary_rows), use_container_width=True, hide_index=True)
+
+            render_data_freshness_notice(list(preset_comparison.values())[0])
+
+            st.caption("그래프에 표시할 프리셋 선택")
+            multi_toggle_cols = st.columns(len(multi_series_map))
+            multi_selected = {}
+            for i, pname in enumerate(multi_series_map.keys()):
+                multi_selected[pname] = multi_toggle_cols[i].checkbox(pname, value=True, key=f"bt_multi_toggle_{pname}")
+
+            multi_chart_df = None
+            for pname in multi_series_map.keys():
+                if not multi_selected.get(pname):
+                    continue
+                multi_chart_df = multi_series_map[pname] if multi_chart_df is None else multi_chart_df.join(multi_series_map[pname], how="outer")
+
+            first_multi_result = list(preset_comparison.values())[0]
+            st.caption("그래프에 표시할 벤치마크 선택")
+            multi_bench_cols = st.columns(len(first_multi_result["benchmarks"]))
+            multi_bench_selected = {}
+            for i, bname in enumerate(first_multi_result["benchmarks"].keys()):
+                multi_bench_selected[bname] = multi_bench_cols[i].checkbox(bname, value=False, key=f"bt_multi_bench_{bname}")
+            for bname, checked in multi_bench_selected.items():
+                if not checked:
+                    continue
+                bench_df = normalize_date_index(pd.DataFrame(first_multi_result["benchmarks"][bname]), value_col="총자산", new_name=bname)
+                multi_chart_df = bench_df if multi_chart_df is None else multi_chart_df.join(bench_df, how="outer")
+
+            if multi_chart_df is not None and len(multi_chart_df.columns) > 0:
+                st.line_chart(multi_chart_df)
+            else:
+                st.info("표시할 항목을 하나 이상 선택해주세요.")
+
+            if st.button("📋 다중 프리셋 비교 결과 출력", key="bt_multi_export"):
+                multi_report_blocks = [
+                    build_backtest_report_text(
+                        pname, db.load_preset_criteria(pname), res["months_back"], res, "여러 프리셋 비교"
+                    )
+                    for pname, res in preset_comparison.items()
+                ]
+                multi_report_text = "\n\n---\n\n".join(multi_report_blocks)
+                st.text_area("아래 내용을 전체 선택(Ctrl+A) 후 복사(Ctrl+C)하세요",
+                             value=multi_report_text, height=400, key="bt_multi_export_text")
