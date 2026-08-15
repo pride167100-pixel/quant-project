@@ -603,6 +603,26 @@ if page == "스크리너 & 모의매매":
             st.cache_data.clear()
             st.rerun()
 
+    with st.sidebar.expander("📈 과거 주가 새로고침 (백테스터용)"):
+        st.caption("백테스터가 쓰는 과거 주가 데이터(historical_prices.csv)를 최신 날짜까지 채워넣습니다. "
+                   "지난번 받아둔 것 이후분만 받아오는 방식이라, 자주 돌릴수록 빨라집니다 "
+                   "(오래 밀려있으면 전종목 기준 20~30분 정도 걸릴 수 있어요). "
+                   "이걸 오래 안 돌리면 백테스터 최근 구간 결과가 부정확해질 수 있습니다.")
+        if st.button("과거 주가 새로고침 시작"):
+            import build_historical_prices
+            hist_progress = st.progress(0.0, text="과거 주가 새로고침 준비 중...")
+
+            def _hist_progress_cb(step, total):
+                hist_progress.progress(step / total, text=f"과거 주가 새로고침 중... ({step}/{total}종목)")
+
+            result = build_historical_prices.main(progress_callback=_hist_progress_cb)
+            hist_progress.empty()
+            st.sidebar.success(
+                f"완료! {result['elapsed_sec']/60:.1f}분 소요 · "
+                f"{result['added_rows']:,}행 추가 · {result['skipped']}개 종목은 이미 최신이라 건너뜀"
+            )
+            st.rerun()
+
     st.divider()
 
     use_ranking_toggle = st.checkbox(
