@@ -308,6 +308,26 @@ def format_currency_cols(view_df, cols):
     return view_df
 
 
+def render_data_freshness_notice(result):
+    """백테스터가 실제로 갖고 있는 과거 주가 데이터가 최신 시점 기준 며칠 전까지인지 표시.
+    많이 오래됐으면(허용범위 21일 초과) 마지막 시점 결과가 부정확할 수 있다고 경고한다
+    (역사적으로, 데이터가 밀린 상태로 백테스트하면 마지막 달 수익률이 크게 왜곡된 적이 있었음)."""
+    staleness = result.get("data_staleness_days")
+    latest_date = result.get("data_latest_price_date")
+    if staleness is None or latest_date is None:
+        return
+    latest_str = pd.to_datetime(latest_date).strftime("%Y-%m-%d")
+    if staleness > 21:
+        st.warning(
+            f"⚠️ 보유 중인 과거 주가 데이터가 **{latest_str}**까지만 있습니다 (백테스트 마지막 시점과 "
+            f"**{staleness}일** 차이). 이 기간 동안은 마지막으로 알려진 가격으로 대체해서 계산했으니, "
+            f"최근 구간(특히 마지막 달) 수익률은 참고용으로만 봐주세요. 정확히 보려면 과거 주가 데이터를 "
+            f"새로고침한 뒤 다시 실행해주세요."
+        )
+    else:
+        st.caption(f"📅 가격 데이터 최신 기준일: {latest_str}")
+
+
 import os
 from datetime import datetime
 
@@ -1038,6 +1058,8 @@ else:
             col2.metric("최종 자산", f"{result['final_value']:,.0f}원")
             col3.metric("총 수익률", f"{result['final_return']:+.2f}%")
 
+            render_data_freshness_notice(result)
+
             st.caption("그래프에 표시할 벤치마크 선택")
             bench_toggle_cols = st.columns(len(result["benchmarks"]))
             selected_benches_single = {}
@@ -1090,6 +1112,8 @@ else:
                 series_map[n] = normalize_date_index(pd.DataFrame(res["portfolio"]), value_col="총자산", new_name=f"{n}개 종목")
 
             st.dataframe(pd.DataFrame(summary_rows), use_container_width=True, hide_index=True)
+
+            render_data_freshness_notice(list(n_comparison.values())[0])
 
             st.caption("그래프에 표시할 종목 수 선택")
             n_toggle_cols = st.columns(len(series_map))

@@ -77,6 +77,25 @@ def fast_price_asof(price_lookup, stock_code, target_date, tolerance_days=21):
     return row["종가"]
 
 
+def fast_price_asof_with_fallback(price_lookup, stock_code, target_date, tolerance_days=21):
+    """fast_price_asof와 같지만, tolerance_days를 넘겨서 최신성 기준에는 못 미쳐도
+    그 종목의 가격 데이터 자체는 있는 경우 '마지막으로 알려진 가격'을 대신 반환한다.
+    (원래는 tolerance 초과 시 그냥 None을 반환했는데, 그러면 호출부에서 그 종목의
+    평가금액이 통째로 누락돼버려서 - 데이터가 오래됐을 뿐인데 - 자산이 증발한 것처럼
+    보이는 문제가 있었음. 종목의 가격 이력 자체가 전혀 없을 때만 None을 반환한다.)
+    반환값: (가격 또는 None, 오래된_데이터로_대체했는지 여부)"""
+    price = fast_price_asof(price_lookup, stock_code, target_date, tolerance_days)
+    if price is not None:
+        return price, False
+    sub = price_lookup.get(stock_code)
+    if sub is None or sub.empty:
+        return None, False
+    idx = sub["날짜"].searchsorted(target_date, side="right") - 1
+    if idx < 0:
+        return None, False
+    return sub.iloc[idx]["종가"], True
+
+
 def prepare_prices_for_vectorized(prices):
     """merge_asof 벡터화 조회를 위해 가격 데이터를 준비.
     종목별 최근 12주 평균거래대금(유동성)도 여기서 한 번만 미리 계산해둔다 (매번 재계산하면 느림)."""
@@ -91,14 +110,31 @@ def prepare_prices_for_vectorized(prices):
 
 
 def merge_asof_prices(stock_codes, target_date, prices_sorted, value_cols=("종가",), tolerance_days=21):
-    """여러 종목의 target_date 시점 값을 한 번에(벡터로) 조회. 반복문 없이 처리해서 훨씬 빠름"""
+    """여러 종목의 target_date 시점 값을 한 번에(벡터로) 조회. 반복문 없이 처리해서 훨씬 빠름.
+    tolerance_days=None이면 최신성 기준 없이 그냥 마지막으로 알려진 값을 씀."""
     target_df = pd.DataFrame({"종목코드": stock_codes, "__date__": target_date})
+    merge_kwargs = dict(left_on="__date__", right_on="날짜", by="종목코드", direction="backward")
+    if tolerance_days is not None:
+        merge_kwargs["tolerance"] = pd.Timedelta(days=tolerance_days)
     result = pd.merge_asof(
-        target_df, prices_sorted[["종목코드", "날짜"] + list(value_cols)],
-        left_on="__date__", right_on="날짜", by="종목코드",
-        direction="backward", tolerance=pd.Timedelta(days=tolerance_days)
+        target_df, prices_sorted[["종목코드", "날짜"] + list(value_cols)], **merge_kwargs
     )
     return result[list(value_cols)]
+
+
+def merge_asof_prices_with_fallback(stock_codes, target_date, prices_sorted, value_cols=("종가",), tolerance_days=21):
+    """merge_asof_prices와 같지만, tolerance_days를 넘겨서 최신성 기준에는 못 미쳐도
+    그 종목의 가격 데이터 자체는 있으면(상장폐지 등이 아니라 그냥 수집이 밀린 것뿐이면)
+    마지막으로 알려진 값을 대신 채워 넣는다. 데이터 수집이 며칠~몇 주 밀린 날에도
+    전종목 스냅샷 자체가 통째로 비어버리는(→ 필터링 결과 0종목) 문제를 막기 위함.
+    반환: (값 DataFrame, 오래된 데이터로 대체된 행 수)"""
+    fresh = merge_asof_prices(stock_codes, target_date, prices_sorted, value_cols, tolerance_days)
+    fallback = merge_asof_prices(stock_codes, target_date, prices_sorted, value_cols, tolerance_days=None)
+    is_stale = fresh[value_cols[0]].isna() & fallback[value_cols[0]].notna()
+    result = fresh.copy()
+    for col in value_cols:
+        result[col] = fresh[col].where(~is_stale, fallback[col])
+    return result, int(is_stale.sum())
 
 
 def merge_asof_timeline(stock_codes, target_date, timeline_sorted, tolerance_days=200):
@@ -131,7 +167,10 @@ def build_historical_snapshot(target_date, static_info, financials, prices_sorte
     codes = df["종목코드"]
 
     # 현재가 + 유동성(12주 평균거래대금) - 한 번의 벡터 조회로 전 종목 처리
-    current = merge_asof_prices(codes, target_date, prices_sorted, value_cols=("종가", "평균거래대금(억원)"))
+    # tolerance_days(21일)를 넘겨서 데이터가 밀려있어도, 그 종목 가격 이력 자체는 있으면
+    # 마지막으로 알려진 값을 씀 (안 그러면 데이터 수집이 며칠만 밀려도 전종목 현재가가
+    # 통째로 NaN이 되어 필터링 결과가 0종목으로 나오는 문제가 있었음)
+    current, _ = merge_asof_prices_with_fallback(codes, target_date, prices_sorted, value_cols=("종가", "평균거래대금(억원)"))
     df["현재가"] = current["종가"]
     df["평균거래대금(억원)"] = current["평균거래대금(억원)"].round(1)
 
@@ -236,6 +275,9 @@ def run_backtest(criteria, months_back, initial_amount=10_000_000, progress_call
     rebalance_dates = get_monthly_rebalance_dates(months_back)
     total_steps = len(rebalance_dates)
 
+    # 이 백테스트에서 실제로 쓸 수 있는 가격 데이터가 가장 최근 어디까지인지 (화면 경고용)
+    data_latest_price_date = prices["날짜"].max() if len(prices) else None
+
     cash = initial_amount
     holdings = {}  # 종목코드 -> 수량
     portfolio_history = []
@@ -249,13 +291,16 @@ def run_backtest(criteria, months_back, initial_amount=10_000_000, progress_call
 
         passing_codes = set(passing["종목코드"]) if len(passing) > 0 else set()
         current_codes = set(holdings.keys())
+        stale_codes_this_step = set()
 
         # 1) 탈락 종목 매도
         to_sell = current_codes - passing_codes
         for code in to_sell:
-            price = fast_price_asof(price_lookup, code, target_date)
+            price, is_stale = fast_price_asof_with_fallback(price_lookup, code, target_date)
             if price is None:
                 continue
+            if is_stale:
+                stale_codes_this_step.add(code)
             qty = holdings.pop(code)
             gross = qty * price
             fee = gross * SELL_FEE_RATE
@@ -282,14 +327,17 @@ def run_backtest(criteria, months_back, initial_amount=10_000_000, progress_call
         # 3) 이 시점 포트폴리오 평가금액 계산
         total_value = cash
         for code, qty in holdings.items():
-            price = fast_price_asof(price_lookup, code, target_date)
+            price, is_stale = fast_price_asof_with_fallback(price_lookup, code, target_date)
             if price:
                 total_value += qty * price
+                if is_stale:
+                    stale_codes_this_step.add(code)
 
         held_names = ", ".join(f"{name_map.get(c, c)}({c})" for c in sorted(holdings.keys())) if holdings else ""
         portfolio_history.append({
             "날짜": target_date, "총자산": total_value, "현금": cash, "보유종목수": len(holdings),
-            "보유종목": held_names
+            "보유종목": held_names,
+            "오래된가격_종목수": len(stale_codes_this_step),
         })
 
         if progress_callback:
@@ -298,10 +346,10 @@ def run_backtest(criteria, months_back, initial_amount=10_000_000, progress_call
     # 벤치마크 계산 (매매 없이 그대로 보유)
     benchmark_results = {}
     for name, code in BACKTEST_BENCHMARKS.items():
-        start_price = fast_price_asof(price_lookup, code, rebalance_dates[0])
+        start_price, _ = fast_price_asof_with_fallback(price_lookup, code, rebalance_dates[0])
         series = []
         for target_date in rebalance_dates:
-            price = fast_price_asof(price_lookup, code, target_date)
+            price, _ = fast_price_asof_with_fallback(price_lookup, code, target_date)
             if start_price and price:
                 value = initial_amount * (price / start_price)
             else:
@@ -312,10 +360,17 @@ def run_backtest(criteria, months_back, initial_amount=10_000_000, progress_call
     final_value = portfolio_history[-1]["총자산"] if portfolio_history else initial_amount
     final_return = (final_value - initial_amount) / initial_amount * 100
 
+    # 마지막 시점 기준 가격 데이터가 며칠이나 오래됐는지 (화면 경고용)
+    data_staleness_days = None
+    if data_latest_price_date is not None and rebalance_dates:
+        data_staleness_days = (rebalance_dates[-1] - data_latest_price_date).days
+
     return {
         "portfolio": portfolio_history,
         "benchmarks": benchmark_results,
         "final_return": final_return,
         "initial_amount": initial_amount,
         "final_value": final_value,
+        "data_latest_price_date": data_latest_price_date,
+        "data_staleness_days": data_staleness_days,
     }
