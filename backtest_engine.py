@@ -249,23 +249,30 @@ def build_historical_snapshot(target_date, static_info, financials, prices_sorte
     return df
 
 
-def get_monthly_rebalance_dates(months_back):
-    """오늘부터 months_back개월 전까지, 매달 같은 날짜의 리밸런싱 일정을 오름차순으로 반환"""
+def get_monthly_rebalance_dates(months_back, interval_months=1):
+    """오늘부터 months_back개월 전까지, interval_months개월 간격으로 리밸런싱 일정을 오름차순으로 반환.
+    간격이 months_back을 나누어떨어뜨리지 않아도, 마지막 리밸런싱은 항상 오늘(현재 시점)이 되도록 보정한다.
+    """
     today = datetime.now()
     dates = []
-    for i in range(months_back, -1, -1):
+    i = months_back
+    while i > 0:
         dates.append(today - relativedelta(months=i))
+        i -= interval_months
+    dates.append(today)
     return dates
 
 
 def run_backtest(criteria, months_back, initial_amount=10_000_000, progress_callback=None,
-                  use_ranking=False, ranking_indicators=None, top_n=20, balance_pct=None, sector_cap=None):
+                  use_ranking=False, ranking_indicators=None, top_n=20, balance_pct=None, sector_cap=None,
+                  rebalance_interval_months=1):
     """
     criteria: screener_logic 형식의 조건 딕셔너리 (1차 필터로 항상 적용됨)
     months_back: 몇 개월 전부터 시작할지 (3, 6, 12, 24, 36 등)
-    use_ranking: True면, 1차 필터 통과 종목 중 랭킹 상위 top_n개만 매달 재선정
+    use_ranking: True면, 1차 필터 통과 종목 중 랭킹 상위 top_n개만 리밸런싱 시점마다 재선정
     ranking_indicators: rank_stocks에 넘길 지표 라벨 리스트 (screener_logic.RANKING_INDICATORS 참고)
     balance_pct/sector_cap: rank_stocks에 그대로 전달 (균형도 필터/업종 분산 - screener_logic.rank_stocks 참고)
+    rebalance_interval_months: 몇 개월마다 리밸런싱할지 (1=매달, 3=분기마다 등)
     반환: {"portfolio": [...], "benchmarks": {...}, "final_return": float}
     """
     static_info, financials, prices, timeline = load_backtest_data()
@@ -273,7 +280,7 @@ def run_backtest(criteria, months_back, initial_amount=10_000_000, progress_call
     price_lookup = build_price_lookup(prices)  # 보유/매매 종목처럼 소수 종목 조회용
     name_map = dict(zip(static_info["종목코드"], static_info["종목명"]))
 
-    rebalance_dates = get_monthly_rebalance_dates(months_back)
+    rebalance_dates = get_monthly_rebalance_dates(months_back, rebalance_interval_months)
     total_steps = len(rebalance_dates)
 
     # 이 백테스트에서 실제로 쓸 수 있는 가격 데이터가 가장 최근 어디까지인지 (화면 경고용)

@@ -1303,7 +1303,7 @@ elif page == "프리셋 비교":
 # ══════════════════════════════════════════════════════════
 else:
     st.title("⏱️ 백테스터")
-    st.caption("과거 특정 시점부터 이 프리셋 조건으로 매달 리밸런싱했다면 어땠을지 계산합니다. "
+    st.caption("과거 특정 시점부터 이 프리셋 조건으로 설정한 주기마다 리밸런싱했다면 어땠을지 계산합니다. "
                "API 호출 없이 미리 받아둔 데이터로만 계산해서 몇 초~몇 분이면 끝납니다.")
 
     st.warning(
@@ -1316,7 +1316,7 @@ else:
     if not saved_presets:
         st.info("저장된 프리셋이 없습니다. 먼저 '스크리너 & 모의매매' 화면에서 조건을 저장해주세요.")
     else:
-        col1, col2, col3 = st.columns(3)
+        col1, col2, col3, col4 = st.columns(4)
         with col1:
             bt_preset = st.selectbox("백테스트할 프리셋", saved_presets, key="bt_preset_select")
 
@@ -1338,10 +1338,17 @@ else:
             bt_initial_amount = st.number_input(
                 "시작 자금 (원)", min_value=100_000, value=10_000_000, step=1_000_000, key="bt_initial_amount"
             )
+        with col4:
+            bt_rebalance_interval = st.number_input(
+                "리밸런싱 주기 (개월마다, 직접입력)", min_value=1, max_value=24, value=1, step=1,
+                key="bt_rebalance_interval",
+                help="1이면 매달, 3이면 분기마다 리밸런싱합니다. 시작 시점과 나누어떨어지지 않아도 "
+                     "마지막 리밸런싱은 항상 오늘(현재 시점)로 맞춰집니다."
+            )
 
         bt_use_ranking = st.checkbox(
-            "상위 N개만 골라 매달 리밸런싱 (랭킹 모드)", key="bt_use_ranking",
-            help="1차 필터를 통과한 종목 중, 선택한 지표들의 순위를 합산해 상위 N개만 매달 다시 선정합니다."
+            "상위 N개만 골라 리밸런싱 주기마다 재선정 (랭킹 모드)", key="bt_use_ranking",
+            help="1차 필터를 통과한 종목 중, 선택한 지표들의 순위를 합산해 상위 N개만 리밸런싱 주기마다 다시 선정합니다."
         )
         bt_ranking_indicators = None
         bt_top_n = 20
@@ -1384,6 +1391,7 @@ else:
                             use_ranking=True, ranking_indicators=bt_ranking_indicators, top_n=n,
                             balance_pct=criteria.get("balance_pct") if criteria.get("use_balance") else None,
                             sector_cap=criteria.get("sector_cap") if criteria.get("use_sector_cap") else None,
+                            rebalance_interval_months=bt_rebalance_interval,
                         )
                     except FileNotFoundError as e:
                         st.error(f"필요한 데이터 파일을 찾을 수 없습니다: {e}")
@@ -1398,7 +1406,7 @@ else:
                 progress_bar = st.progress(0.0, text="백테스트 계산 중...")
 
                 def _update_progress(step, total):
-                    progress_bar.progress(step / total, text=f"백테스트 계산 중... ({step}/{total}개월)")
+                    progress_bar.progress(step / total, text=f"백테스트 계산 중... ({step}/{total}회차)")
 
                 try:
                     result = bt.run_backtest(
@@ -1407,6 +1415,7 @@ else:
                         use_ranking=bt_use_ranking, ranking_indicators=bt_ranking_indicators, top_n=bt_top_n,
                         balance_pct=criteria.get("balance_pct") if criteria.get("use_balance") else None,
                         sector_cap=criteria.get("sector_cap") if criteria.get("use_sector_cap") else None,
+                        rebalance_interval_months=bt_rebalance_interval,
                     )
                     progress_bar.empty()
                     st.session_state["_backtest_result"] = result
@@ -1564,20 +1573,45 @@ else:
 
         st.divider()
         st.subheader("🆚 여러 프리셋 동시 비교")
-        st.caption("위 설정과 무관하게, 각 프리셋에 **저장된 조건**(필터/랭킹 설정 그대로) 그대로 여러 프리셋을 한 번에 "
-                   "백테스트해서 비교합니다.")
+        st.caption("각 프리셋에 **저장된 필터/랭킹 지표 설정**은 그대로 쓰지만, 리밸런싱 주기와 종목 수는 "
+                   "프리셋별로 아래에서 직접 다르게 설정할 수 있습니다.")
 
         compare_presets = st.multiselect("비교할 프리셋 선택 (2개 이상)", saved_presets, key="bt_multi_preset_select")
         col_m1, col_m2 = st.columns(2)
         with col_m1:
             compare_months = st.selectbox(
-                "시작 시점", [3, 6, 12, 24, 36], index=2,
+                "시작 시점 (공통)", [3, 6, 12, 24, 36], index=2,
                 format_func=lambda m: f"{m}개월 전부터", key="bt_multi_months_back"
             )
         with col_m2:
             compare_initial = st.number_input(
-                "시작 자금 (원)", min_value=100_000, value=10_000_000, step=1_000_000, key="bt_multi_initial_amount"
+                "시작 자금 (원, 공통)", min_value=100_000, value=10_000_000, step=1_000_000, key="bt_multi_initial_amount"
             )
+
+        multi_overrides = {}
+        if compare_presets:
+            st.caption("프리셋별 리밸런싱 주기 / 종목 수 (직접입력)")
+            for pname in compare_presets:
+                pcriteria = db.load_preset_criteria(pname)
+                p_is_ranking = bool(pcriteria) and pcriteria.get("mode") == "랭킹 모드"
+                default_top_n = pcriteria.get("top_n", 20) if pcriteria else 20
+
+                c1, c2, c3 = st.columns([2, 1, 1])
+                with c1:
+                    label = pname if p_is_ranking else f"{pname} _(필터 모드 - 종목 수 설정 무시됨)_"
+                    st.markdown(f"**{label}**")
+                with c2:
+                    rebal_key = f"bt_multi_rebal_{pname}"
+                    interval = st.number_input(
+                        "리밸런싱 주기(개월)", min_value=1, max_value=24, value=1, step=1, key=rebal_key
+                    )
+                with c3:
+                    topn_key = f"bt_multi_topn_{pname}"
+                    topn = st.number_input(
+                        "종목 수", min_value=1, max_value=200, value=default_top_n, step=1, key=topn_key,
+                        disabled=not p_is_ranking
+                    )
+                multi_overrides[pname] = {"interval": interval, "top_n": topn}
 
         if st.button("▶️ 여러 프리셋 백테스트 실행", key="bt_multi_run"):
             if len(compare_presets) < 2:
@@ -1591,7 +1625,8 @@ else:
                         continue
                     p_use_ranking = pcriteria.get("mode") == "랭킹 모드"
                     p_ranking_indicators = pcriteria.get("ranking_labels") if p_use_ranking else None
-                    p_top_n = pcriteria.get("top_n", 20)
+                    p_top_n = multi_overrides[pname]["top_n"]
+                    p_interval = multi_overrides[pname]["interval"]
 
                     def _update_multi_progress(step, total, i=i, pname=pname):
                         overall = (i + step / total) / len(compare_presets)
@@ -1604,6 +1639,7 @@ else:
                             use_ranking=p_use_ranking, ranking_indicators=p_ranking_indicators, top_n=p_top_n,
                             balance_pct=pcriteria.get("balance_pct") if pcriteria.get("use_balance") else None,
                             sector_cap=pcriteria.get("sector_cap") if pcriteria.get("use_sector_cap") else None,
+                            rebalance_interval_months=p_interval,
                         )
                     except FileNotFoundError as e:
                         st.error(f"필요한 데이터 파일을 찾을 수 없습니다: {e}")
